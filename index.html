@@ -1,0 +1,2181 @@
+<!DOCTYPE html>
+<html lang="fr" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestion de Chantiers (Pro)</title>
+    
+    <!-- SCRIPT CRITIQUE: Détection immédiate du mode invité pour cacher le mot de passe -->
+    <script>
+        // Si l'URL contient "guest=", on ajoute immédiatement la classe pour cacher le lock-screen
+        if (window.location.search.includes('guest=')) {
+            document.documentElement.classList.add('is-guest');
+        }
+    </script>
+
+    <!-- OPTIMISATION: Pré-connexion aux domaines critiques -->
+    <link rel="preconnect" href="https://cdn.tailwindcss.com">
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com">
+    <link rel="preconnect" href="https://www.gstatic.com">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <!-- LIENS PWA -->
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#0f172a">
+    <link rel="apple-touch-icon" href="./apple-icon-180.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+    <!-- Police Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        slate: {
+                            850: '#1e293b', // Custom dark
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <!-- JSPDF et AUTOTABLE -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+    
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            addDoc, 
+            updateDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            collection, 
+            query,
+            setLogLevel,
+            writeBatch, 
+            enableIndexedDbPersistence 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Début de la logique de l'application ---
+
+        let app, db, auth;
+        let currentUserId = null;
+        let isAuthReady = false;
+        let allChantiers = []; 
+        let globalAnnuaire = [];
+        let chantiersUnsubscribe = null; 
+        let annuaireUnsubscribe = null;
+        
+        // 2. LOGIQUE MODE INVITÉ (Lecture Seule)
+        const urlParams = new URLSearchParams(window.location.search);
+        const guestChantierId = urlParams.get('guest');
+        const isGuestMode = !!guestChantierId;
+
+        // Configuration Firebase PERSONNALISÉE
+        const firebaseConfig = {
+            apiKey: "AIzaSyCV-ZfKVI3Wcy4nuxjo_JCYKnDJSdflqW8",
+            authDomain: "suivie-chantier-v3.firebaseapp.com",
+            projectId: "suivie-chantier-v3",
+            storageBucket: "suivie-chantier-v3.firebasestorage.app",
+            messagingSenderId: "418345972836",
+            appId: "1:418345972836:web:f9eafff77395fd4bce5b71",
+            measurementId: "G-Q61B5QFH9W"
+        };
+        
+        // Chemins simplifiés
+        const collectionPath = "chantiers";
+        const annuaireCollectionPath = "annuaire";
+
+        let appState = {
+            currentView: 'dashboard', 
+            currentChantierId: null,
+            currentReunionId: null,
+            currentUploadTarget: null, 
+            reunionTemplates: [
+                "Point sur le planning général (PGO)",
+                "Revue des anomalies (FSA) en cours",
+                "Point sur la sécurité (PDP)",
+                "Validation modifications techniques",
+                "Prochaines étapes et points de blocage"
+            ],
+            // Variable temporaire pour stocker les données d'import avant sélection
+            pendingImportData: [] 
+        };
+
+        // --- CALENDRIER STATE ---
+        let calendarState = {
+            currentDate: new Date(),
+            events: []
+        };
+
+        const UI = {};
+
+        // --- Fonctions de gestion des données (Firestore) ---
+        
+        function loadData() {
+            if (chantiersUnsubscribe) chantiersUnsubscribe(); 
+            if (annuaireUnsubscribe) annuaireUnsubscribe();
+            if (!db || !isAuthReady) return; 
+
+            // Load Chantiers
+            const q = query(collection(db, collectionPath));
+            chantiersUnsubscribe = onSnapshot(q, (querySnapshot) => {
+                allChantiers = [];
+                querySnapshot.forEach((doc) => {
+                    allChantiers.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Si mode invité, on force la vue
+                if (isGuestMode && appState.currentView === 'dashboard') {
+                    const target = allChantiers.find(c => c.id === guestChantierId);
+                    if (target) {
+                        appState.currentChantierId = guestChantierId;
+                        appState.currentView = 'chantier';
+                        document.body.classList.add('guest-mode');
+                        document.getElementById('guest-banner').style.display = 'block';
+                    } else {
+                        showToast("Chantier introuvable ou supprimé", "error");
+                    }
+                }
+
+                if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'none';
+                render(); 
+            }, (error) => {
+                console.error("Erreur Firestore: ", error);
+                if (error.code === 'permission-denied') {
+                    showToast("Erreur de permission. Vérifiez les règles Firestore.", "error");
+                }
+                if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'none';
+            });
+
+            // 1. Load Annuaire Global
+            const qa = query(collection(db, annuaireCollectionPath));
+            annuaireUnsubscribe = onSnapshot(qa, (snap) => {
+                globalAnnuaire = [];
+                snap.forEach((doc) => globalAnnuaire.push({id: doc.id, ...doc.data()}));
+            });
+        }
+        
+        async function updateChantier(chantierId, updatedData) {
+            if (isGuestMode) { showToast("Modification interdite en mode invité", "error"); return; }
+            if (!db || !chantierId) return;
+            try {
+                const docRef = doc(db, collectionPath, chantierId);
+                await updateDoc(docRef, updatedData);
+            } catch (error) {
+                console.error("Erreur update:", error);
+                showToast("Erreur de sauvegarde", "error");
+            }
+        }
+        
+        function getCurrentChantier() {
+            return allChantiers.find(c => c.id === appState.currentChantierId);
+        }
+
+        // --- Fonctions de rendu (Optimisées) ---
+
+        function render() {
+            if (!UI.dashboardView) return; 
+
+            // Gestion simple des classes actives
+            [UI.dashboardView, UI.chantierView, UI.reunionView].forEach(el => el.classList.remove('active'));
+
+            if (appState.currentView === 'dashboard') {
+                if (isGuestMode) {
+                    appState.currentView = 'chantier'; 
+                    render();
+                    return;
+                }
+                UI.dashboardView.classList.add('active');
+                renderDashboard();
+            } else if (appState.currentView === 'chantier') {
+                const chantier = getCurrentChantier();
+                if (chantier) {
+                    UI.chantierView.classList.add('active');
+                    renderChantierDetail(chantier);
+                } else if (isGuestMode) {
+                     UI.chantierList.innerHTML = `<p class="text-center p-10">Chargement du chantier invité...</p>`;
+                } else {
+                    appState.currentView = 'dashboard';
+                    appState.currentChantierId = null;
+                    UI.dashboardView.classList.add('active');
+                    renderDashboard();
+                }
+            } else if (appState.currentView === 'reunion') {
+                const chantier = getCurrentChantier();
+                const reunion = chantier?.reunions?.find(r => r.id === appState.currentReunionId);
+                if (reunion) {
+                    UI.reunionView.classList.add('active');
+                    renderReunionDetail(chantier, reunion);
+                } else {
+                    appState.currentView = 'chantier';
+                    render();
+                }
+            }
+            
+            // 5. INITIALISER LA DICTÉE VOCALE SUR LES NOUVEAUX ÉLÉMENTS
+            initSpeechRecognition();
+        }
+
+        function renderDashboard() {
+            UI.chantierList.innerHTML = '';
+            if (allChantiers.length === 0) {
+                UI.chantierList.innerHTML = `<p class="text-slate-400 italic col-span-full text-center">Aucun chantier. Cliquez sur "Nouveau Chantier" pour commencer ou importez une sauvegarde.</p>`;
+                return;
+            }
+
+            const sortedChantiers = [...allChantiers].sort((a, b) => a.name.localeCompare(b.name));
+            const fragment = document.createDocumentFragment();
+
+            sortedChantiers.forEach(chantier => {
+                const departs = chantier.departs || [];
+                let anomaliesEnCours = 0;
+                let totalTempsPasse = 0;
+                let departsTermines = 0;
+                
+                departs.forEach(d => {
+                    if(d.termine) departsTermines++;
+                    (d.anomalies || []).forEach(a => {
+                        if(a.etat === 'en cours') anomaliesEnCours++;
+                        totalTempsPasse += (a.tempsPasse || 0);
+                    });
+                });
+
+                const progression = departs.length > 0 ? (departsTermines / departs.length) * 100 : 0;
+                
+                let tagsHtml = '';
+                const today = new Date(); today.setHours(0,0,0,0);
+
+                if(chantier.infos && chantier.infos.echeance) {
+                    const diffDays = Math.ceil((new Date(chantier.infos.echeance) - today) / (86400000));
+                    if (diffDays < 0) tagsHtml += `<div class="tag bg-red-600 text-white">Échéance dépassée</div>`;
+                    else if (diffDays <= 30) tagsHtml += `<div class="tag bg-orange-500 text-white">Échéance proche</div>`;
+                }
+                
+                const nextReunion = (chantier.reunions || [])
+                    .filter(r => new Date(r.date) >= today)
+                    .sort((a, b) => new Date(a.date) - new Date(b.date))[0];
+
+                if (nextReunion) {
+                    const d = new Date(nextReunion.date);
+                    const isSoon = (d - today) / 86400000 <= 3; // Bientôt si <= 3 jours
+                    const color = isSoon ? 'bg-purple-600' : 'bg-slate-600';
+                    tagsHtml += `<div class="tag ${color} text-white"><i class="fas fa-calendar-alt mr-1"></i> ${d.toLocaleDateString('fr-FR', {day:'numeric', month:'short'})}</div>`;
+                }
+                
+                if(anomaliesEnCours > 0) {
+                     tagsHtml += `<div class="tag bg-red-500 text-white"><i class="fas fa-exclamation-triangle mr-1"></i> ${anomaliesEnCours}</div>`;
+                } else {
+                     tagsHtml += `<div class="tag bg-green-600 text-white"><i class="fas fa-check mr-1"></i> 0</div>`;
+                }
+
+                const div = document.createElement('div');
+                // CORRECTION LIGHT MODE: bg-white en priorité pour light, bg-slate-800 pour dark
+                div.className = "chantier-card bg-white/90 dark:bg-slate-800/90 border dark:border-slate-700 border-gray-200 rounded-xl shadow-lg p-5 cursor-pointer transition-transform transform hover:-translate-y-1 flex flex-col backdrop-blur-sm";
+                div.dataset.id = chantier.id;
+                div.innerHTML = `
+                    <div class="flex-grow">
+                        <h3 class="text-xl font-bold dark:text-white text-slate-800 mb-3 truncate pointer-events-none">${chantier.name}</h3>
+                        <div class="flex flex-wrap items-start content-start mb-4 min-h-[56px] pointer-events-none">
+                            ${tagsHtml}
+                        </div>
+                    </div>
+                    <div class="pointer-events-none">
+                        <p class="text-sm text-slate-500 dark:text-slate-400 mb-1">Progression (${departsTermines}/${departs.length})</p>
+                        <div class="w-full progress-bar-bg rounded-full h-2.5 bg-gray-200 dark:bg-slate-700">
+                            <div class="progress-bar-fill h-2.5 rounded-full bg-green-500" style="width: ${progression}%"></div>
+                        </div>
+                    </div>
+                `;
+                fragment.appendChild(div);
+            });
+            
+            UI.chantierList.appendChild(fragment);
+        }
+        
+        function renderChantierDetail(chantier) {
+            UI.chantierTitleContainer.innerHTML = `
+                <h1 class="text-3xl sm:text-4xl font-extrabold dark:text-white text-slate-800 truncate drop-shadow-md">${chantier.name}</h1>
+                <button id="edit-chantier-title-btn" class="ml-4 text-slate-400 hover:text-blue-500 transition-colors flex-shrink-0 guest-hidden">
+                    <i class="fas fa-edit text-2xl"></i>
+                </button>
+            `;
+            if(!isGuestMode) document.getElementById('edit-chantier-title-btn').onclick = editChantierName;
+
+            renderTimeline(chantier);
+            renderInfos(chantier);
+            renderDocs(chantier);
+            renderTodos(chantier);
+            renderReunions(chantier);
+            renderDeparts(chantier);
+        }
+
+        function renderTimeline(chantier) {
+            const container = document.getElementById('chantier-timeline-container');
+            const start = chantier.infos?.dateDebut ? new Date(chantier.infos.dateDebut) : new Date(new Date().setMonth(new Date().getMonth() - 1)); // Default -1 mois
+            const end = chantier.infos?.echeance ? new Date(chantier.infos.echeance) : new Date(new Date().setMonth(new Date().getMonth() + 1)); // Default +1 mois
+            const today = new Date();
+
+            const totalTime = end - start;
+            const elapsedTime = today - start;
+            let percent = (elapsedTime / totalTime) * 100;
+            percent = Math.max(0, Math.min(100, percent)); // Clamp 0-100
+
+            const formatDate = (d) => d.toLocaleDateString('fr-FR', {day:'numeric', month:'short'});
+
+            container.innerHTML = `
+                <div class="flex justify-between text-xs font-bold text-slate-500 dark:text-slate-400 mb-1">
+                    <span>Début: ${formatDate(start)}</span>
+                    <span>Fin: ${formatDate(end)}</span>
+                </div>
+                <div class="relative w-full h-4 bg-gray-300 dark:bg-slate-700 rounded-full">
+                    <div class="absolute top-0 left-0 h-4 bg-blue-600 rounded-full opacity-50" style="width: ${percent}%"></div>
+                    <div class="absolute top-1/2 transform -translate-y-1/2 -translate-x-1/2 w-4 h-4 bg-white border-2 border-blue-600 rounded-full shadow" style="left: ${percent}%" title="Aujourd'hui"></div>
+                </div>
+                <div class="text-center text-xs mt-1 ${percent > 100 ? 'text-red-500 font-bold' : 'text-slate-600 dark:text-slate-500'}">
+                    ${percent >= 100 ? 'Date échéance dépassée !' : `Avancement temporel : ${Math.round(percent)}%`}
+                </div>
+            `;
+        }
+
+        function renderInfos(chantier) {
+            const contactsHtml = ((chantier.infos || {}).contacts || []).map(c => `
+                <div class="p-2 border-b dark:border-slate-700 border-gray-200 flex flex-col sm:flex-row sm:justify-between sm:items-center">
+                    <div>
+                        <p class="font-bold dark:text-slate-200 text-slate-800">${c.role}</p>
+                        <p class="text-slate-500 dark:text-slate-300">${c.name} ${c.company ? `<span class="text-xs bg-slate-600 text-white px-1 rounded">${c.company}</span>` : ''}</p>
+                        <p class="text-sm text-slate-500 dark:text-slate-400">${c.phone || ''} | ${c.email || ''}</p>
+                    </div>
+                    <div class="mt-2 sm:mt-0 flex-shrink-0 guest-hidden">
+                        <button class="edit-contact-btn text-blue-400 hover:text-blue-300 mr-2" data-id="${c.id}"><i class="fas fa-edit"></i></button>
+                        <button class="delete-contact-btn text-red-500 hover:text-red-400" data-id="${c.id}"><i class="fas fa-trash"></i></button>
+                    </div>
+                </div>
+            `).join('');
+
+            UI.chantierInfosWrapper.innerHTML = `
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <div>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1">Date de Début</label>
+                        <input type="date" id="chantier-debut-input" value="${(chantier.infos || {}).dateDebut || ''}" class="bg-gray-50 dark:bg-slate-700 border border-gray-300 dark:border-slate-600 text-slate-900 dark:text-white p-2 rounded-lg w-full">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1">Échéance globale</label>
+                        <input type="date" id="chantier-echeance-input" value="${(chantier.infos || {}).echeance || ''}" class="bg-gray-50 dark:bg-slate-700 border border-gray-300 dark:border-slate-600 text-slate-900 dark:text-white p-2 rounded-lg w-full">
+                    </div>
+                </div>
+                <div>
+                    <div class="flex justify-between items-center mb-2">
+                         <h4 class="text-lg font-bold dark:text-slate-300 text-slate-700">Contacts</h4>
+                         <button id="add-contact-btn" class="bg-slate-600 hover:bg-slate-500 text-white text-xs font-bold py-1 px-2 rounded-lg guest-hidden"><i class="fas fa-plus"></i> Ajouter</button>
+                    </div>
+                    <div class="space-y-2" id="contacts-list-container">${contactsHtml || '<p class="italic text-slate-500">Aucun contact.</p>'}</div>
+                </div>
+            `;
+        }
+
+        function renderDocs(chantier) {
+            const docCategories = { pgo: "Planning (PGO)", pdp: "Plan de Prévention (PDP)", nip: "Note d'Info (NIP)", cr: "Comptes-Rendus", divers: "Autres Documents" };
+            const specialCats = ['pgo', 'pdp', 'nip'];
+            
+            const html = Object.keys(docCategories).map(catKey => {
+                const files = (chantier.documents || {})[catKey] || [];
+                const mainLink = (chantier.documents || {})[catKey + "_link"];
+                
+                let headerHtml = `<h4 class="text-lg font-bold dark:text-slate-300 text-slate-700">${docCategories[catKey]}</h4>`;
+                let linkBtnHtml = '';
+                
+                if (specialCats.includes(catKey)) {
+                    if (mainLink) {
+                        headerHtml = `<a href="${mainLink}" target="_blank" class="text-lg font-bold text-blue-500 hover:underline">${docCategories[catKey]}</a>`;
+                        linkBtnHtml = `<button class="edit-main-link-btn text-blue-400 hover:text-blue-300 text-xs ml-3 guest-hidden" data-cat-key="${catKey}"><i class="fas fa-edit mr-1"></i>Modifier Lien</button>`;
+                    } else {
+                        linkBtnHtml = `<button class="edit-main-link-btn text-green-500 hover:text-green-400 text-xs ml-3 guest-hidden" data-cat-key="${catKey}"><i class="fas fa-plus mr-1"></i>Ajouter Lien</button>`;
+                    }
+                }
+
+                const filesHtml = files.map(f => {
+                    const isLocal = f.url && f.url.startsWith('data:');
+                    const icon = isLocal ? `<i class="fas fa-image mr-2 text-yellow-500"></i>` : `<i class="fas fa-file-alt mr-2 text-slate-400"></i>`;
+                    return `
+                    <div class="flex flex-col sm:flex-row justify-between sm:items-center bg-gray-50 dark:bg-slate-700 border dark:border-slate-600 border-gray-200 p-2 rounded-md shadow-sm">
+                        <a ${isLocal ? '' : `href="${f.url}" download="${f.name}" target="_blank"`} class="${isLocal ? 'text-slate-600 dark:text-slate-400' : 'text-blue-500 hover:underline'} flex-grow truncate mr-4 mb-2 sm:mb-0">
+                           ${icon} ${f.name}
+                        </a>
+                        <div class="flex items-center flex-shrink-0">
+                            <span class="text-xs text-slate-500 mr-3">${f.date}</span>
+                            ${!isLocal ? `<button class="share-doc-btn text-teal-500 hover:text-teal-400 text-xs mr-2" data-doc-name="${f.name}" data-doc-url="${f.url}"><i class="fas fa-share-square mr-1"></i></button>` : ''}
+                            <button class="delete-doc-btn text-red-500 hover:text-red-400 text-xs guest-hidden" data-doc-type="${catKey}" data-doc-name="${f.name}"><i class="fas fa-trash"></i></button>
+                        </div>
+                    </div>`;
+                }).join('');
+
+                return `
+                    <div class="doc-category-block" data-cat-key="${catKey}">
+                        <div class="flex flex-col sm:flex-row justify-between sm:items-center mb-2">
+                            <div class="flex items-center mb-2 sm:mb-0">
+                                ${headerHtml}
+                                ${linkBtnHtml}
+                            </div>
+                            <button class="add-doc-btn bg-slate-600 hover:bg-slate-500 text-white text-xs font-bold py-1 px-2 rounded-lg guest-hidden" data-doc-type="${catKey}">
+                                <i class="fas fa-plus"></i> Ajouter...
+                            </button>
+                        </div>
+                        <div class="space-y-2">${filesHtml || '<p class="italic text-slate-500 text-sm">Aucun document.</p>'}</div>
+                    </div>
+                `;
+            }).join('');
+            
+            UI.chantierDocsWrapper.innerHTML = html;
+        }
+        
+        function renderTodos(chantier) {
+            const sortedTodos = [...(chantier.todos || [])].sort((a, b) => {
+                if (a.done === b.done) return 0;
+                return a.done ? 1 : -1;
+            });
+
+            UI.chantierTodoContent.innerHTML = sortedTodos.map(todo => {
+                let rappelHtml = '';
+                if(todo.rappelDate) {
+                    const rDate = new Date(todo.rappelDate);
+                    const today = new Date();
+                    let color = 'text-slate-400';
+                    if (!todo.done && rDate < today) color = 'text-red-500';
+                    else if (!todo.done && (rDate - today) / 86400000 <= 3) color = 'text-orange-500';
+                    rappelHtml = `<p class="text-xs ${color}">Rappel: ${rDate.toLocaleString('fr-FR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}</p>`;
+                }
+                
+                // CORRECTION LIGHT MODE: Couleurs claires explicites
+                const doneClass = todo.done ? 'opacity-50 bg-gray-100 dark:bg-slate-800/50 order-last' : 'bg-gray-50 dark:bg-slate-700';
+
+                return `
+                <div class="p-2 rounded-md hover:bg-gray-100 dark:hover:bg-slate-600 ${doneClass} flex flex-col transition-all duration-300 border dark:border-transparent border-gray-200 shadow-sm">
+                    <div class="flex items-center w-full">
+                        <input type="checkbox" data-id="${todo.id}" ${todo.done ? 'checked' : ''} class="todo-checkbox w-4 h-4 text-blue-600 bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600 rounded focus:ring-blue-600 flex-shrink-0">
+                        <div class="ml-3 flex-grow min-w-0">
+                            <label class="text-sm font-medium item-text break-words ${todo.done ? 'line-through text-slate-500' : 'dark:text-slate-200 text-slate-800'}">${todo.text}</label>
+                            ${rappelHtml}
+                        </div>
+                        <button class="edit-todo-btn text-blue-400 hover:text-blue-300 ml-2 flex-shrink-0 guest-hidden" data-id="${todo.id}"><i class="fas fa-edit"></i></button>
+                    </div>
+                    ${todo.done ? `<div class="flex justify-end mt-2 guest-hidden"><button class="acquitter-todo-btn bg-red-600 hover:bg-red-700 text-white text-xs font-bold py-1 px-2 rounded-lg" data-id="${todo.id}">Supprimer</button></div>` : ''}
+                </div>
+            `}).join('') || '<p class="italic text-slate-500 text-sm">Aucune tâche.</p>';
+        }
+
+        function renderReunions(chantier) {
+            const sorted = [...(chantier.reunions || [])].sort((a, b) => new Date(b.date) - new Date(a.date));
+            UI.chantierReunionsContent.innerHTML = sorted.map(r => `
+                <div class="flex items-center justify-between bg-gray-50 dark:bg-slate-700 border dark:border-slate-600 border-gray-200 p-3 rounded-md hover:bg-gray-100 dark:hover:bg-slate-600 group shadow-sm">
+                    <div class="reunion-item-clickable flex-grow cursor-pointer min-w-0" data-id="${r.id}">
+                        <p class="truncate dark:text-slate-200 text-slate-800"><i class="fas fa-calendar-check mr-2 text-slate-400"></i> Réunion du ${new Date(r.date).toLocaleDateString('fr-FR')}</p>
+                    </div>
+                    <div class="flex-shrink-0 ml-4 guest-hidden">
+                        <button class="edit-reunion-btn text-blue-400 hover:text-blue-300 mr-3" data-id="${r.id}"><i class="fas fa-edit"></i></button>
+                        <button class="delete-reunion-btn text-red-500 hover:text-red-400" data-id="${r.id}"><i class="fas fa-trash"></i></button>
+                    </div>
+                </div>
+            `).join('') || '<p class="italic text-slate-500 text-sm">Aucune réunion planifiée.</p>';
+        }
+
+        function renderDeparts(chantier) {
+            UI.chantierDepartsContent.innerHTML = '';
+            if ((chantier.departs || []).length === 0) {
+                UI.chantierDepartsContent.innerHTML = '<p class="italic text-slate-500 text-sm">Aucun départ ajouté.</p>';
+                return;
+            }
+            
+            const fragment = document.createDocumentFragment();
+
+            chantier.departs.forEach(depart => {
+                const el = document.createElement('div');
+                // CORRECTION LIGHT MODE
+                el.className = 'bg-gray-50 dark:bg-slate-700/50 border dark:border-slate-600 border-gray-200 rounded-lg depart-container shadow-sm mb-3';
+                // Stocker l'ID comme string pour éviter les bugs de type
+                el.dataset.departId = depart.id; 
+                
+                const anomaliesEnCours = (depart.anomalies || []).filter(a => a.etat === 'en cours').length;
+                let echeanceColor = 'text-slate-400';
+                if (depart.echeance && !depart.termine) {
+                    const days = (new Date(depart.echeance) - new Date()) / 86400000;
+                    if (days < 0) echeanceColor = 'text-red-500';
+                    else if (days <= 30) echeanceColor = 'text-orange-500';
+                }
+
+                const anomaliesHtml = (depart.anomalies || []).map(ano => {
+                    const isDone = ano.etat === 'soldé';
+                    const color = ano.etat === 'en cours' ? 'bg-orange-500' : (isDone ? 'bg-green-500' : 'bg-slate-500');
+                    return `
+                        <div class="flex flex-col sm:flex-row justify-between sm:items-center p-2 border-t dark:border-slate-600 border-gray-200 ${isDone ? 'item-done' : ''}">
+                            <div class="min-w-0 flex-grow">
+                                <p class="break-words item-text dark:text-slate-200 text-slate-800">${ano.desc}</p>
+                                <p class="text-xs text-slate-400">Temps: ${ano.tempsPasse || 0}h</p>
+                            </div>
+                            <div class="flex items-center mt-2 sm:mt-0 flex-shrink-0 ml-4">
+                                <span class="tag ${color} text-white">${ano.etat}</span>
+                                <div class="guest-hidden flex items-center">
+                                    <button class="edit-anomalie-btn text-blue-400 hover:text-blue-300 ml-2" data-anomalie-id="${ano.id}"><i class="fas fa-edit"></i></button>
+                                    <button class="add-ano-to-reunion-btn text-purple-400 hover:text-purple-300 ml-2" data-anomalie-id="${ano.id}"><i class="fas fa-calendar-plus"></i></button>
+                                    ${isDone ? `<button class="acquitter-anomalie-btn bg-red-600 hover:bg-red-700 text-white text-xs font-bold py-1 px-2 rounded-lg ml-2" data-anomalie-id="${ano.id}">X</button>` : ''}
+                                </div>
+                            </div>
+                        </div>`;
+                }).join('');
+
+                el.innerHTML = `
+                    <div class="flex flex-wrap items-center p-3 cursor-pointer depart-header">
+                        <div class="flex items-center flex-grow min-w-0 w-full sm:w-auto mb-2 sm:mb-0">
+                            <i class="fas fa-chevron-right transition-transform mr-3 dark:text-white text-slate-800"></i>
+                            <span class="font-bold flex-grow truncate dark:text-white text-slate-800">${depart.name}</span>
+                            <div class="guest-hidden inline-flex">
+                                <button class="edit-depart-name-btn text-slate-400 hover:text-blue-500 text-xs ml-2"><i class="fas fa-edit"></i></button>
+                                <button class="delete-depart-btn text-red-500 hover:text-red-400 text-xs ml-2 mr-3"><i class="fas fa-trash"></i></button>
+                            </div>
+                            ${anomaliesEnCours > 0 ? `<span class="tag bg-red-500 text-white mr-3">${anomaliesEnCours}</span>` : ''}
+                        </div>
+                        <div class="flex flex-wrap sm:flex-nowrap justify-between w-full sm:w-auto sm:ml-auto space-y-2 sm:space-y-0 sm:space-x-4">
+                            <div class="text-sm flex items-center w-full sm:w-auto">
+                               <span class="text-xs text-slate-400 mr-2 flex-shrink-0">Mise en service:</span>
+                               <input type="date" value="${depart.echeance || ''}" class="depart-echeance-input bg-white dark:bg-slate-700 border dark:border-slate-600 border-slate-300 p-1 rounded-md text-xs w-full ${echeanceColor}">
+                            </div>
+                            <div class="flex items-center flex-shrink-0">
+                                <input type="checkbox" class="depart-done-checkbox" ${depart.termine ? 'checked' : ''} class="w-4 h-4 text-green-600 bg-gray-700 border-gray-600 rounded focus:ring-green-600">
+                                <span class="ml-2 text-sm dark:text-slate-300 text-slate-700">Terminé</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="collapsible-content pl-4 sm:pl-8 pr-4 pb-4">
+                        <h4 class="text-sm font-bold text-slate-500 dark:text-slate-400 mt-3 mb-2">Anomalies (FSA)</h4>
+                        <div class="space-y-2 mb-3">${anomaliesHtml || '<p class="italic text-slate-500 text-xs px-2">Aucune anomalie.</p>'}</div>
+                        <div class="flex flex-wrap justify-start gap-2 mt-4 border-t dark:border-slate-700 border-gray-200 pt-3 guest-hidden">
+                            <button class="add-anomalie-btn bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-1 px-2 rounded-lg"><i class="fas fa-plus"></i> Anomalie</button>
+                            <button class="add-depart-doc-btn bg-gray-600 hover:bg-gray-500 text-white text-xs font-bold py-1 px-2 rounded-lg"><i class="fas fa-plus"></i> Document</button>
+                        </div>
+                    </div>
+                `;
+                fragment.appendChild(el);
+            });
+            
+            UI.chantierDepartsContent.appendChild(fragment);
+        }
+        
+        function renderReunionDetail(chantier, reunion) {
+            document.getElementById('reunion-title').textContent = `Réunion du ${new Date(reunion.date).toLocaleDateString('fr-FR')}`;
+            UI.reunionNotesContent.innerHTML = Object.entries(reunion.notes).map(([question, note]) => `
+                <div>
+                    <div class="flex justify-between items-center">
+                        <label class="block text-sm font-bold dark:text-slate-300 text-slate-700 mb-2 flex-grow break-words">${question}</label>
+                        <button class="delete-agenda-item-btn text-red-500 hover:text-red-400 ml-4 text-xs flex-shrink-0 guest-hidden" data-question="${question.replace(/"/g, '&quot;')}"><i class="fas fa-trash"></i></button>
+                    </div>
+                    <div class="relative">
+                        <textarea data-question="${question.replace(/"/g, '&quot;')}" class="w-full bg-gray-50 dark:bg-slate-700 border dark:border-slate-600 border-gray-300 p-2 rounded-lg dark:text-slate-200 text-slate-800 speech-input" rows="3">${note || ''}</textarea>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // 5. DICTÉE VOCALE (SPEECH-TO-TEXT)
+        function initSpeechRecognition() {
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) return;
+            
+            document.querySelectorAll('textarea:not(.has-mic), input[type="text"]:not(.has-mic)').forEach(input => {
+                input.classList.add('has-mic');
+                const wrapper = document.createElement('div');
+                wrapper.className = 'relative w-full';
+                input.parentNode.insertBefore(wrapper, input);
+                wrapper.appendChild(input);
+
+                const micBtn = document.createElement('button');
+                micBtn.className = 'absolute right-2 top-2 text-slate-400 hover:text-blue-500 bg-transparent transition-colors z-10';
+                micBtn.innerHTML = '<i class="fas fa-microphone"></i>';
+                micBtn.title = "Dicter le texte";
+                micBtn.onclick = (e) => {
+                    e.preventDefault();
+                    startDictation(input, micBtn);
+                };
+                wrapper.appendChild(micBtn);
+            });
+        }
+
+        function startDictation(inputElement, btnElement) {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            const recognition = new SpeechRecognition();
+            recognition.lang = 'fr-FR';
+            recognition.interimResults = false;
+            recognition.maxAlternatives = 1;
+
+            recognition.start();
+            btnElement.classList.add('text-red-500', 'animate-pulse');
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                const start = inputElement.selectionStart;
+                const end = inputElement.selectionEnd;
+                const text = inputElement.value;
+                const before = text.substring(0, start);
+                const after = text.substring(end, text.length);
+                
+                const prefix = (before.length > 0 && !before.endsWith(' ')) ? ' ' : '';
+                
+                inputElement.value = before + prefix + transcript + after;
+                inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+
+            recognition.onspeechend = () => {
+                recognition.stop();
+                btnElement.classList.remove('text-red-500', 'animate-pulse');
+            };
+
+            recognition.onerror = (event) => {
+                console.error('Erreur reconnaissance vocale: ' + event.error);
+                btnElement.classList.remove('text-red-500', 'animate-pulse');
+                showToast("Erreur micro: " + event.error, 'error');
+            };
+        }
+
+
+        // --- Logique de Délégation d'Événements ---
+        
+        function setupEventListeners() {
+            UI.chantierList.addEventListener('click', (e) => {
+                const card = e.target.closest('.chantier-card');
+                if (card) {
+                    appState.currentChantierId = card.dataset.id; 
+                    appState.currentView = 'chantier';
+                    render();
+                }
+            });
+            
+            UI.chantierInfosWrapper.addEventListener('click', (e) => {
+                const target = e.target;
+                if(target.closest('#add-contact-btn')) { openContactModal(); return; }
+                const editBtn = target.closest('.edit-contact-btn');
+                if(editBtn) { openContactModal(parseInt(editBtn.dataset.id)); return; }
+                const delBtn = target.closest('.delete-contact-btn');
+                if(delBtn) { deleteContact(parseInt(delBtn.dataset.id)); return; }
+            });
+            UI.chantierInfosWrapper.addEventListener('change', async (e) => {
+                if(e.target.id === 'chantier-echeance-input') {
+                    await updateChantier(appState.currentChantierId, { 'infos.echeance': e.target.value });
+                    showToast("Échéance mise à jour", "success");
+                    render(); // Update timeline
+                }
+                if(e.target.id === 'chantier-debut-input') {
+                     await updateChantier(appState.currentChantierId, { 'infos.dateDebut': e.target.value });
+                     showToast("Date début mise à jour", "success");
+                     render(); // Update timeline
+                }
+            });
+
+            UI.chantierDocsWrapper.addEventListener('click', (e) => {
+                const target = e.target;
+                const chantier = getCurrentChantier();
+                const editLink = target.closest('.edit-main-link-btn');
+                if(editLink) { openLinkModal(editLink.dataset.catKey); return; }
+                const addBtn = target.closest('.add-doc-btn');
+                if(addBtn) { showAddDocOptions({type: 'chantier', docType: addBtn.dataset.docType}); return; }
+                const delBtn = target.closest('.delete-doc-btn');
+                if(delBtn) { deleteDocFromDb(delBtn.dataset.docType, null, delBtn.dataset.docName); return; }
+                const shareBtn = target.closest('.share-doc-btn');
+                if(shareBtn) { shareDocByEmail(chantier, shareBtn.dataset.docName, shareBtn.dataset.docUrl); return; }
+            });
+
+            UI.chantierTodoContent.addEventListener('click', (e) => {
+                const target = e.target;
+                const editBtn = target.closest('.edit-todo-btn');
+                if(editBtn) { openTodoModal(parseInt(editBtn.dataset.id)); return; }
+                const acqBtn = target.closest('.acquitter-todo-btn');
+                if(acqBtn) {
+                    const todoId = parseInt(acqBtn.dataset.id);
+                    const chantier = getCurrentChantier();
+                    const todo = chantier.todos.find(t => t.id === todoId);
+                    showConfirmationModal(`Supprimer "${todo.text}" ?`, async () => {
+                         const newTodos = getCurrentChantier().todos.filter(t => t.id !== todoId);
+                         await updateChantier(chantier.id, { todos: newTodos });
+                         showToast("Tâche supprimée");
+                    });
+                    return;
+                }
+            });
+            UI.chantierTodoContent.addEventListener('change', async (e) => {
+                if(e.target.type === 'checkbox') {
+                    const todoId = parseInt(e.target.dataset.id);
+                    const chantier = getCurrentChantier();
+                    const newTodos = chantier.todos.map(t => t.id === todoId ? { ...t, done: e.target.checked } : t);
+                    await updateChantier(chantier.id, { todos: newTodos });
+                    renderTodos(getCurrentChantier()); // Re-render pour appliquer le tri
+                }
+            });
+
+            UI.chantierReunionsContent.addEventListener('click', (e) => {
+                const target = e.target;
+                const editBtn = target.closest('.edit-reunion-btn');
+                if(editBtn) { openEditReunionModal(parseInt(editBtn.dataset.id)); return; }
+                const delBtn = target.closest('.delete-reunion-btn');
+                if(delBtn) { deleteReunion(parseInt(delBtn.dataset.id)); return; }
+                const item = target.closest('.reunion-item-clickable');
+                if(item) {
+                    appState.currentReunionId = parseInt(item.dataset.id);
+                    appState.currentView = 'reunion';
+                    render();
+                }
+            });
+
+            // GESTION CORRIGÉE DES CLICS DÉPARTS
+            UI.chantierDepartsContent.addEventListener('click', (e) => {
+                const target = e.target;
+                const departContainer = target.closest('.depart-container');
+                if (!departContainer) return;
+                
+                // Récupération ID Robuste (Compatibilité String/Int)
+                const departIdStr = departContainer.dataset.departId;
+                const chantier = getCurrentChantier();
+                
+                // On cherche l'objet pour récupérer son vrai ID typé
+                const realDepart = chantier.departs.find(d => String(d.id) === departIdStr);
+                const departId = realDepart ? realDepart.id : departIdStr;
+
+                if(target.closest('.delete-depart-btn')) { deleteDepart(departId); return; }
+                
+                const editNameBtn = target.closest('.edit-depart-name-btn');
+                if(editNameBtn) {
+                     editDepartName(departId, realDepart.name); return;
+                }
+                
+                if(target.closest('.add-anomalie-btn')) { openAnomalieModal(departId); return; }
+                if(target.closest('.add-depart-doc-btn')) { showAddDocOptions({type: 'depart', departId: departId}); return; }
+                
+                const editAno = target.closest('.edit-anomalie-btn');
+                if(editAno) { openAnomalieModal(departId, parseInt(editAno.dataset.anomalieId)); return; }
+                const addAnoReu = target.closest('.add-ano-to-reunion-btn');
+                if(addAnoReu) { addAnomalieToNextReunion(departId, parseInt(addAnoReu.dataset.anomalieId)); return; }
+                const acqAno = target.closest('.acquitter-anomalie-btn');
+                if(acqAno) { deleteAnomalie(departId, parseInt(acqAno.dataset.anomalieId)); return; }
+                
+                const delDoc = target.closest('.delete-doc-btn');
+                if(delDoc) { deleteDocFromDb('depart', departId, delDoc.dataset.docName); return; }
+
+                const header = target.closest('.depart-header');
+                if(header && !target.closest('button') && target.tagName !== 'INPUT') {
+                    const content = header.nextElementSibling;
+                    const icon = header.querySelector('.fa-chevron-right');
+                    if (content.style.maxHeight) {
+                        content.style.maxHeight = null;
+                        icon.style.transform = 'rotate(0deg)';
+                    } else {
+                        content.style.maxHeight = content.scrollHeight + "px";
+                        icon.style.transform = 'rotate(90deg)';
+                    }
+                }
+            });
+
+            // GESTION CORRIGÉE DES CHANGEMENTS (DATES & CHECKBOXES)
+            UI.chantierDepartsContent.addEventListener('change', async (e) => {
+                const target = e.target;
+                const departContainer = target.closest('.depart-container');
+                if (!departContainer) return;
+                
+                // Récupération ID Robuste (String pour comparaison sûre)
+                const departIdStr = departContainer.dataset.departId;
+                const chantier = getCurrentChantier();
+
+                if(target.classList.contains('depart-echeance-input')) {
+                    // Utilisation de String(d.id) pour garantir la compatibilité
+                    const newDeparts = chantier.departs.map(d => String(d.id) === departIdStr ? { ...d, echeance: target.value } : d);
+                    await updateChantier(chantier.id, { departs: newDeparts });
+                    showToast("Date mise à jour", "success");
+                }
+                else if(target.classList.contains('depart-done-checkbox')) {
+                    const newDeparts = chantier.departs.map(d => String(d.id) === departIdStr ? { ...d, termine: target.checked } : d);
+                    await updateChantier(chantier.id, { departs: newDeparts });
+                    showToast("Statut mis à jour", "success");
+                }
+            });
+            
+            UI.reunionNotesContent.addEventListener('change', async (e) => {
+                if(e.target.tagName === 'TEXTAREA') {
+                    const question = e.target.dataset.question;
+                    const chantier = getCurrentChantier();
+                    const newReunions = chantier.reunions.map(r => {
+                        if (r.id === appState.currentReunionId) {
+                            return { ...r, notes: { ...r.notes, [question]: e.target.value } };
+                        }
+                        return r;
+                    });
+                    await updateChantier(chantier.id, { reunions: newReunions });
+                }
+            });
+            UI.reunionNotesContent.addEventListener('click', (e) => {
+                const btn = e.target.closest('.delete-agenda-item-btn');
+                if(btn) {
+                    const question = btn.dataset.question;
+                     showConfirmationModal(`Supprimer "${question}" ?`, async () => {
+                        const chantier = getCurrentChantier();
+                        const newReunions = chantier.reunions.map(r => {
+                            if (r.id === appState.currentReunionId) {
+                                const newNotes = { ...r.notes };
+                                delete newNotes[question];
+                                return { ...r, notes: newNotes };
+                            }
+                            return r;
+                        });
+                        await updateChantier(chantier.id, { reunions: newReunions });
+                        showToast("Point supprimé");
+                    });
+                }
+            });
+        }
+
+        // --- Fonctions Utilitaires & Modaux ---
+        
+        function openModal(modal) { modal.classList.add('flex'); }
+        function closeModal(modal) { modal.classList.remove('flex'); }
+
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const bg = type === 'error' ? 'bg-red-600' : (type === 'success' ? 'bg-green-600' : 'bg-slate-700');
+            const icon = type === 'error' ? 'fa-exclamation-circle' : (type === 'success' ? 'fa-check-circle' : 'fa-info-circle');
+            
+            toast.className = `${bg} text-white px-4 py-3 rounded-lg shadow-xl flex items-center mb-3 transform transition-all duration-500 translate-y-full opacity-0`;
+            toast.innerHTML = `<i class="fas ${icon} mr-3"></i><span>${message}</span>`;
+            
+            container.appendChild(toast);
+            
+            requestAnimationFrame(() => {
+                toast.classList.remove('translate-y-full', 'opacity-0');
+            });
+
+            setTimeout(() => {
+                toast.classList.add('opacity-0', 'translate-y-4');
+                setTimeout(() => toast.remove(), 500);
+            }, 3000);
+        }
+
+        function showGenericModal(title, content, confirmText, onConfirm, onCancel = null) {
+            const m = UI.modalGeneric;
+            document.getElementById('modal-generic-title').textContent = title;
+            document.getElementById('modal-generic-content').innerHTML = content;
+            
+            const btnConf = document.getElementById('modal-generic-confirm');
+            const btnClose = m.querySelector('.modal-close');
+            
+            if (confirmText) {
+                btnConf.classList.remove('hidden');
+                btnConf.textContent = confirmText;
+            } else {
+                btnConf.classList.add('hidden');
+            }
+            
+            btnClose.textContent = confirmText ? 'Annuler' : 'Fermer';
+
+            const newConf = btnConf.cloneNode(true);
+            const newClose = btnClose.cloneNode(true);
+            btnConf.parentNode.replaceChild(newConf, btnConf);
+            btnClose.parentNode.replaceChild(newClose, btnClose);
+
+            newClose.onclick = () => { closeModal(m); if(onCancel) onCancel(); };
+            if(confirmText) {
+                newConf.onclick = () => { if(onConfirm) onConfirm(); };
+            }
+            openModal(m);
+        }
+
+        function showConfirmationModal(msg, onConfirm) { showGenericModal("Confirmation", `<p class="dark:text-white text-slate-800">${msg}</p>`, "Confirmer", () => { closeModal(UI.modalGeneric); onConfirm(); }); }
+
+        // --- Initialisation ---
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            UI.dashboardView = document.getElementById('dashboard-view');
+            UI.chantierView = document.getElementById('chantier-view');
+            UI.reunionView = document.getElementById('reunion-view');
+            UI.chantierList = document.getElementById('chantier-list');
+            UI.modalGeneric = document.getElementById('modal-generic');
+            UI.loadingOverlay = document.getElementById('loading-overlay');
+            
+            UI.chantierTitleContainer = document.getElementById('chantier-title-container');
+            UI.chantierInfosWrapper = document.getElementById('chantier-infos-content-wrapper');
+            UI.chantierDocsWrapper = document.getElementById('chantier-docs-content-wrapper');
+            UI.chantierTodoContent = document.getElementById('chantier-todo-content');
+            UI.chantierReunionsContent = document.getElementById('chantier-reunions-content');
+            UI.chantierDepartsContent = document.getElementById('chantier-departs-content');
+            UI.reunionNotesContent = document.getElementById('reunion-notes-content');
+
+            setupEventListeners();
+
+            document.getElementById('chantier-infos-header').onclick = function() { toggleAccordion(this, 'chantier-infos-content', 'chantier-infos-content-wrapper'); };
+            document.getElementById('chantier-docs-header').onclick = function() { toggleAccordion(this, 'chantier-docs-content', 'chantier-docs-content-wrapper'); };
+
+            document.getElementById('back-to-dashboard-btn').onclick = () => { appState.currentView='dashboard'; appState.currentChantierId=null; render(); };
+            document.getElementById('back-to-chantier-btn').onclick = () => { appState.currentView='chantier'; render(); };
+            
+            const themeToggleBtn = document.getElementById('theme-toggle-btn');
+            // Check Local Storage
+            if(localStorage.getItem('theme') === 'light') {
+                document.documentElement.classList.remove('dark');
+            }
+            
+            themeToggleBtn.onclick = () => {
+                document.documentElement.classList.toggle('dark');
+                const isDark = document.documentElement.classList.contains('dark');
+                localStorage.setItem('theme', isDark ? 'dark' : 'light');
+            };
+
+            // INIT BACKGROUND
+            initBackground();
+
+            setupMenus();
+            setupLogin();
+            setupStaticButtons();
+
+            window.addEventListener('online', updateOnlineStatus);
+            window.addEventListener('offline', updateOnlineStatus);
+            updateOnlineStatus();
+        });
+        
+        // --- BACKGROUND MANAGEMENT ---
+        function initBackground() {
+            const bgUrl = localStorage.getItem('app_bg_image');
+            if (bgUrl) {
+                document.body.style.setProperty('--bg-image', `url('${bgUrl}')`);
+                document.body.classList.add('has-custom-bg');
+            }
+        }
+
+        function openBackgroundModal() {
+             const html = `
+                <div class="space-y-4">
+                    <p class="text-sm text-slate-500 dark:text-slate-400">Personnalisez le fond d'écran de l'application (Login & Dashboard).</p>
+                    
+                    <div class="p-3 bg-gray-100 dark:bg-slate-700 rounded-lg">
+                        <label class="block text-sm font-bold mb-2 dark:text-white text-slate-800">Option A: Via URL</label>
+                        <input type="text" id="bg-url-input" placeholder="https://exemple.com/image.jpg" class="w-full bg-white dark:bg-slate-600 border border-gray-300 dark:border-transparent rounded p-2 mb-2 dark:text-white text-slate-800">
+                        <button id="save-bg-url-btn" class="bg-blue-600 text-white text-xs font-bold py-1 px-3 rounded">Appliquer URL</button>
+                    </div>
+
+                    <div class="p-3 bg-gray-100 dark:bg-slate-700 rounded-lg">
+                        <label class="block text-sm font-bold mb-2 dark:text-white text-slate-800">Option B: Choisir un fichier</label>
+                        <input type="file" id="bg-file-input" accept="image/*" class="w-full text-sm text-slate-500 dark:text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+                    </div>
+
+                    <div class="text-right mt-4">
+                        <button id="reset-bg-btn" class="text-red-500 hover:text-red-400 text-sm underline">Supprimer le fond d'écran</button>
+                    </div>
+                </div>
+             `;
+             showGenericModal("Changer Fond d'écran", html, "Fermer", null);
+             
+             // Handlers
+             document.getElementById('save-bg-url-btn').onclick = () => {
+                 const url = document.getElementById('bg-url-input').value.trim();
+                 if(url) { setBackground(url); showToast("Fond d'écran appliqué !"); closeModal(UI.modalGeneric); }
+             };
+             
+             document.getElementById('bg-file-input').onchange = (e) => {
+                 const file = e.target.files[0];
+                 if(file) {
+                     const reader = new FileReader();
+                     reader.onload = (ev) => {
+                         setBackground(ev.target.result);
+                         showToast("Fond d'écran appliqué !");
+                         closeModal(UI.modalGeneric);
+                     };
+                     reader.readAsDataURL(file);
+                 }
+             };
+
+             document.getElementById('reset-bg-btn').onclick = () => {
+                 localStorage.removeItem('app_bg_image');
+                 document.body.classList.remove('has-custom-bg');
+                 document.body.style.removeProperty('--bg-image');
+                 showToast("Fond d'écran supprimé");
+                 closeModal(UI.modalGeneric);
+             }
+        }
+
+        function setBackground(url) {
+            try {
+                localStorage.setItem('app_bg_image', url);
+                document.body.style.setProperty('--bg-image', `url('${url}')`);
+                document.body.classList.add('has-custom-bg');
+            } catch (e) {
+                console.error(e);
+                showToast("Image trop lourde pour le stockage local", "error");
+            }
+        }
+
+
+        function toggleAccordion(header, contentId, wrapperId) {
+             const content = document.getElementById(contentId);
+             const icon = header.querySelector('.fa-chevron-right');
+             if (content.style.maxHeight) {
+                 content.style.maxHeight = null;
+                 icon.style.transform = 'rotate(0deg)';
+             } else {
+                 const wrapper = document.getElementById(wrapperId);
+                 content.style.maxHeight = wrapper.scrollHeight + "px";
+                 icon.style.transform = 'rotate(90deg)';
+             }
+        }
+
+        function setupMenus() {
+             const bindMenu = (btnId, dropId, containerId) => {
+                 const btn = document.getElementById(btnId);
+                 const drop = document.getElementById(dropId);
+                 if(!btn || !drop) return;
+                 btn.onclick = (e) => { e.stopPropagation(); drop.classList.toggle('hidden'); };
+                 drop.querySelectorAll('button').forEach(b => b.onclick = () => drop.classList.add('hidden'));
+                 window.addEventListener('click', (e) => {
+                     if(!document.getElementById(containerId).contains(e.target)) drop.classList.add('hidden');
+                 });
+             };
+             bindMenu('edition-menu-btn', 'edition-menu-dropdown', 'edition-menu-container');
+             bindMenu('chantier-edition-menu-btn', 'chantier-edition-menu-dropdown', 'chantier-edition-menu-container');
+        }
+        
+        function setupLogin() {
+            if(isGuestMode) {
+                document.getElementById('lock-screen').style.display = 'none';
+                document.body.classList.add('guest-mode');
+                if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'flex';
+                initializeAppLogic();
+                return;
+            }
+
+            const lock = document.getElementById('lock-screen');
+            const pass = document.getElementById('password-input');
+            const err = document.getElementById('error-message');
+            
+            const doLogin = () => {
+                if(pass.value === "Emasi1587!") {
+                    err.classList.add('hidden');
+                    lock.style.display = 'none';
+                    try { localStorage.setItem('app_password_verified', 'true'); } catch(e){}
+                    if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'flex';
+                    initializeAppLogic();
+                } else {
+                    err.classList.remove('hidden');
+                    pass.value = "";
+                }
+            };
+            
+            if(localStorage.getItem('app_password_verified') === 'true') {
+                lock.style.display = 'none';
+                if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'flex';
+                initializeAppLogic();
+            } else {
+                document.getElementById('login-btn').onclick = doLogin;
+                pass.onkeypress = (e) => { if(e.key === 'Enter') doLogin(); };
+            }
+        }
+
+        function setupStaticButtons() {
+             document.getElementById('add-chantier-btn').onclick = () => {
+                 document.getElementById('new-chantier-name').value = '';
+                 openModal(document.getElementById('modal-new-chantier'));
+             };
+             document.querySelector('#modal-new-chantier .modal-close').onclick = () => closeModal(document.getElementById('modal-new-chantier'));
+
+             document.getElementById('confirm-add-chantier').onclick = async () => {
+                const name = document.getElementById('new-chantier-name').value.trim();
+                if (name) {
+                    await addDoc(collection(db, collectionPath), {
+                        name, infos: {echeance:'', dateDebut: new Date().toISOString().split('T')[0], contacts:[]}, documents:{pgo:[],pdp:[],nip:[],cr:[],divers:[]}, todos:[], reunions:[], departs:[]
+                    });
+                    closeModal(document.getElementById('modal-new-chantier'));
+                    showToast("Chantier créé", "success");
+                }
+             };
+             
+             document.getElementById('manage-annuaire-btn').onclick = openAnnuaireModal;
+
+             document.getElementById('show-calendar-btn').onclick = initAndShowCalendar;
+             document.getElementById('change-bg-btn').onclick = openBackgroundModal;
+
+             document.getElementById('export-global-btn').onclick = exportGlobalBackup;
+             document.getElementById('import-global-btn').onclick = triggerImport;
+             document.getElementById('import-file-input').onchange = handleImportFile;
+
+             document.getElementById('add-todo-btn').onclick = () => openTodoModal();
+             document.getElementById('add-depart-btn').onclick = async () => {
+                 const n = prompt("Nom du départ :");
+                 if(n && n.trim()) {
+                     const c = getCurrentChantier();
+                     const nd = [...(c.departs||[]), {id:Date.now(), name:n.trim(), echeance:'', termine:false, anomalies:[], attentionPoints:[], documents:[]}];
+                     await updateChantier(c.id, {departs:nd});
+                     showToast("Départ ajouté");
+                 }
+             };
+             document.getElementById('plan-reunion-btn').onclick = openPlanReunionModal;
+             document.getElementById('delete-chantier-btn').onclick = deleteChantier;
+             document.getElementById('export-chantier-json-btn').onclick = exportChantierJSON;
+             document.getElementById('export-chantier-btn').onclick = exportChantier;
+             document.getElementById('export-chantier-pdf-btn').onclick = exportChantierPdf;
+             
+             document.getElementById('share-guest-link-btn').onclick = () => {
+                 const link = `${window.location.origin}${window.location.pathname}?guest=${appState.currentChantierId}`;
+                 navigator.clipboard.writeText(link).then(() => showToast("Lien invité copié !", "success"));
+             };
+
+             document.getElementById('add-question-btn').onclick = async () => {
+                 const input = document.getElementById('new-question-input');
+                 const val = input.value.trim();
+                 if(val) {
+                     const c = getCurrentChantier();
+                     const nr = c.reunions.map(r => r.id === appState.currentReunionId ? {...r, notes: {...r.notes, [val]: ""}} : r);
+                     await updateChantier(c.id, {reunions: nr});
+                     input.value = '';
+                 }
+             };
+             document.getElementById('export-txt-btn').onclick = exportReunionTxt;
+             document.getElementById('export-pdf-btn').onclick = exportReunionPdf;
+             document.getElementById('share-reunion-mail-btn').onclick = shareReunionByEmail;
+             document.getElementById('copy-onenote-btn').onclick = copyReunionForOneNote;
+
+             document.getElementById('photo-input').onchange = handlePhotoUpload;
+        }
+
+        // --- Fonctions métier ---
+
+        function updateOnlineStatus() {
+            const el = document.getElementById('online-status');
+            if(!el) return;
+            const ind = el.querySelector('.status-indicator');
+            if(navigator.onLine) { ind.classList.add('online'); ind.classList.remove('offline'); el.querySelector('span').textContent = 'En ligne'; }
+            else { ind.classList.add('offline'); ind.classList.remove('online'); el.querySelector('span').textContent = 'Hors ligne'; }
+        }
+        
+        async function initializeAppLogic() {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('silent'); 
+                
+                try { await enableIndexedDbPersistence(db); } catch(e){}
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        isAuthReady = true;
+                        if(!isGuestMode) document.getElementById('auth-status').innerHTML = `Connecté`;
+                        loadData();
+                    } else {
+                        isAuthReady = false;
+                    }
+                });
+
+                await signInAnonymously(auth);
+
+            } catch (error) {
+                console.error("Init Error", error);
+                if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'none';
+                showToast("Erreur d'initialisation Firebase. Vérifiez la console.", "error");
+            }
+        }
+        
+        // 1. GESTION ANNUAIRE GLOBAL FONCTIONS
+        function openAnnuaireModal() {
+            const renderList = () => {
+                const list = globalAnnuaire.sort((a,b) => a.name.localeCompare(b.name));
+                return `
+                    <div class="space-y-2 mt-4">
+                        ${list.map(e => `
+                            <div class="flex justify-between items-center bg-gray-100 dark:bg-slate-700 p-2 rounded">
+                                <div>
+                                    <p class="font-bold dark:text-white text-slate-900">${e.company || 'Entreprise ?'}</p>
+                                    <p class="text-sm text-slate-600 dark:text-slate-300">${e.name} - ${e.role}</p>
+                                </div>
+                                <button onclick="window.deleteGlobalContact('${e.id}')" class="text-red-400 hover:text-red-300"><i class="fas fa-trash"></i></button>
+                            </div>
+                        `).join('') || '<p class="text-slate-500 italic">Annuaire vide</p>'}
+                    </div>
+                    <div class="mt-4 pt-4 border-t border-slate-600">
+                        <h4 class="font-bold mb-2 dark:text-white text-slate-800">Ajouter à l'annuaire</h4>
+                        <div class="grid grid-cols-2 gap-2 mb-2">
+                            <input id="ga-company" placeholder="Entreprise" class="bg-gray-50 dark:bg-slate-700 p-2 rounded text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                            <input id="ga-role" placeholder="Rôle (ex: Élec)" class="bg-gray-50 dark:bg-slate-700 p-2 rounded text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                            <input id="ga-name" placeholder="Nom Contact" class="bg-gray-50 dark:bg-slate-700 p-2 rounded text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                            <input id="ga-phone" placeholder="Téléphone" class="bg-gray-50 dark:bg-slate-700 p-2 rounded text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                            <input id="ga-email" placeholder="Email" class="bg-gray-50 dark:bg-slate-700 p-2 rounded text-slate-900 dark:text-white border border-gray-300 dark:border-transparent col-span-2">
+                        </div>
+                        <button id="btn-add-ga" class="w-full bg-green-600 py-2 rounded font-bold text-white">Ajouter</button>
+                    </div>
+                `;
+            };
+            
+            window.deleteGlobalContact = async (id) => {
+                 await deleteDoc(doc(db, annuaireCollectionPath, id));
+                 const contentDiv = document.getElementById('annuaire-content');
+                 if(contentDiv) contentDiv.innerHTML = renderList();
+            };
+
+            showGenericModal("Annuaire Global Entreprises", `<div id="annuaire-content">${renderList()}</div>`, "Fermer", null);
+            
+            document.getElementById('modal-generic').addEventListener('click', async (e) => {
+                if(e.target.id === 'btn-add-ga') {
+                    const company = document.getElementById('ga-company').value;
+                    const name = document.getElementById('ga-name').value;
+                    if(company && name) {
+                        await addDoc(collection(db, annuaireCollectionPath), {
+                            company, name, 
+                            role: document.getElementById('ga-role').value,
+                            phone: document.getElementById('ga-phone').value,
+                            email: document.getElementById('ga-email').value
+                        });
+                        document.getElementById('annuaire-content').innerHTML = renderList();
+                        showToast("Entreprise ajoutée");
+                    }
+                }
+            });
+        }
+
+        function editChantierName() {
+            const c = getCurrentChantier();
+            const n = prompt("Nouveau nom :", c.name);
+            if(n && n.trim() && n !== c.name) updateChantier(c.id, {name: n.trim()});
+        }
+        
+        function openContactModal(id=null) {
+             const c = getCurrentChantier();
+             const ct = id ? c.infos.contacts.find(x=>x.id===id) : null;
+             
+             let importHtml = '';
+             if(!id && globalAnnuaire.length > 0) {
+                 importHtml = `
+                    <div class="mb-4 p-2 bg-gray-200 dark:bg-slate-600 rounded">
+                        <label class="text-sm mb-1 block text-slate-800 dark:text-white">Importer depuis l'Annuaire :</label>
+                        <select id="import-annuaire-select" class="w-full bg-white dark:bg-slate-700 p-2 rounded text-slate-900 dark:text-white">
+                            <option value="">-- Choisir --</option>
+                            ${globalAnnuaire.map(e => `<option value="${e.id}">${e.company} - ${e.name}</option>`).join('')}
+                        </select>
+                    </div>
+                 `;
+             }
+
+             const html = `
+                ${importHtml}
+                <div class="space-y-4">
+                    <input type="text" id="c-role" value="${ct?.role||''}" placeholder="Rôle" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                    <input type="text" id="c-company" value="${ct?.company||''}" placeholder="Entreprise" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                    <input type="text" id="c-name" value="${ct?.name||''}" placeholder="Nom" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                    <input type="tel" id="c-phone" value="${ct?.phone||''}" placeholder="Téléphone" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                    <input type="email" id="c-email" value="${ct?.email||''}" placeholder="Email" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                </div>`;
+                
+             showGenericModal(ct?"Modifier Contact":"Ajouter Contact", html, ct?"Modifier":"Ajouter", async () => {
+                 const role = document.getElementById('c-role').value;
+                 const name = document.getElementById('c-name').value;
+                 if(!role || !name) return;
+                 const nc = {
+                     id: id||Date.now(), role, name, 
+                     company: document.getElementById('c-company').value,
+                     phone:document.getElementById('c-phone').value, 
+                     email:document.getElementById('c-email').value
+                 };
+                 const list = id ? c.infos.contacts.map(x=>x.id===id?nc:x) : [...(c.infos.contacts||[]), nc];
+                 await updateChantier(c.id, {'infos.contacts': list});
+                 closeModal(UI.modalGeneric);
+                 showToast("Contact enregistré", "success");
+             });
+             
+             setTimeout(() => {
+                const sel = document.getElementById('import-annuaire-select');
+                if(sel) {
+                    sel.onchange = () => {
+                        const selected = globalAnnuaire.find(x => x.id === sel.value);
+                        if(selected) {
+                            document.getElementById('c-role').value = selected.role;
+                            document.getElementById('c-company').value = selected.company;
+                            document.getElementById('c-name').value = selected.name;
+                            document.getElementById('c-phone').value = selected.phone;
+                            document.getElementById('c-email').value = selected.email;
+                        }
+                    }
+                }
+             }, 100);
+        }
+
+        async function deleteContact(id) {
+            showConfirmationModal("Supprimer ce contact ?", async () => {
+                const c = getCurrentChantier();
+                await updateChantier(c.id, {'infos.contacts': c.infos.contacts.filter(x=>x.id!==id)});
+                showToast("Contact supprimé");
+            });
+        }
+        
+        function showAddDocOptions(target) {
+            appState.currentUploadTarget = target;
+            const html = `
+                <div class="flex flex-col gap-4">
+                    <button id="add-doc-link-act" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-lg">
+                        <i class="fas fa-link mr-2"></i>Depuis un lien Internet
+                    </button>
+                    <button id="add-doc-photo-act" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg">
+                        <i class="fas fa-camera mr-2"></i>Prendre une photo / Galerie
+                    </button>
+                </div>
+            `;
+            showGenericModal("Ajouter un document", html, null, null);
+            
+            document.getElementById('add-doc-link-act').onclick = () => {
+                const url = prompt("URL du document :");
+                if(url) {
+                    const doc = {name: url.split('/').pop()||url, date: new Date().toLocaleDateString('fr-FR'), url};
+                    addDocToTarget(doc);
+                    showToast("Lien ajouté");
+                }
+                closeModal(UI.modalGeneric);
+            };
+            
+            document.getElementById('add-doc-photo-act').onclick = () => {
+                document.getElementById('photo-input').click(); 
+                closeModal(UI.modalGeneric);
+            };
+        }
+        
+        async function handlePhotoUpload(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            showToast("Compression en cours...", "info");
+            try {
+                const compressedBase64 = await compressImage(file);
+                const doc = {
+                    name: `Photo_${new Date().toLocaleTimeString().replace(/:/g,'-')}.jpg`,
+                    date: new Date().toLocaleDateString('fr-FR'),
+                    url: compressedBase64
+                };
+                await addDocToTarget(doc);
+                showToast("Photo ajoutée !", "success");
+            } catch (err) {
+                console.error(err);
+                showToast("Erreur lors de l'ajout de la photo", "error");
+            }
+            e.target.value = null; 
+        }
+
+        function compressImage(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = (event) => {
+                    const img = new Image();
+                    img.src = event.target.result;
+                    img.onload = () => {
+                        const canvas = document.createElement('canvas');
+                        const MAX_WIDTH = 1024; 
+                        const scaleSize = MAX_WIDTH / img.width;
+                        const newWidth = (img.width > MAX_WIDTH) ? MAX_WIDTH : img.width;
+                        const newHeight = (img.width > MAX_WIDTH) ? img.height * scaleSize : img.height;
+                        
+                        canvas.width = newWidth;
+                        canvas.height = newHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, newWidth, newHeight);
+                        resolve(canvas.toDataURL('image/jpeg', 0.6)); 
+                    };
+                    img.onerror = (err) => reject(err);
+                };
+                reader.onerror = (err) => reject(err);
+            });
+        }
+
+        async function addDocToTarget(doc) {
+             const t = appState.currentUploadTarget;
+             const c = getCurrentChantier();
+             if(t.type === 'chantier') {
+                 const list = [...((c.documents||{})[t.docType]||[]), doc];
+                 await updateChantier(c.id, {[`documents.${t.docType}`]: list});
+             } else {
+                 const nd = c.departs.map(d => d.id === t.departId ? {...d, documents: [...d.documents, doc]} : d);
+                 await updateChantier(c.id, {departs: nd});
+             }
+        }
+        async function deleteDocFromDb(type, depId, name) {
+            showConfirmationModal(`Supprimer "${name}" ?`, async () => {
+                const c = getCurrentChantier();
+                if(type === 'depart') {
+                    const nd = c.departs.map(d => d.id === depId ? {...d, documents: d.documents.filter(x=>x.name!==name)} : d);
+                    await updateChantier(c.id, {departs: nd});
+                } else {
+                    await updateChantier(c.id, {[`documents.${type}`]: c.documents[type].filter(x=>x.name!==name)});
+                }
+                showToast("Document supprimé");
+            });
+        }
+        function openLinkModal(key) {
+             const c = getCurrentChantier();
+             const url = (c.documents||{})[key+"_link"]||"";
+             showGenericModal("Lien Principal", `<input id="lnk-in" value="${url}" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">`, "Sauvegarder", async () => {
+                 await updateChantier(c.id, {[`documents.${key}_link`]: document.getElementById('lnk-in').value});
+                 closeModal(UI.modalGeneric);
+             });
+        }
+        function openTodoModal(id=null) {
+            const c = getCurrentChantier();
+            const t = id ? c.todos.find(x=>x.id===id) : null;
+            const html = `
+                <div class="space-y-4">
+                    <input type="text" id="t-txt" value="${t?.text||''}" placeholder="Description" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                    <input type="datetime-local" id="t-rap" value="${t?.rappelDate||''}" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                </div>`;
+            showGenericModal(t?"Modifier Tâche":"Ajouter Tâche", html, t?"Modifier":"Ajouter", async () => {
+                const text = document.getElementById('t-txt').value;
+                if(!text) return;
+                const nt = {id: id||Date.now(), text, done: t?.done||false, rappelDate: document.getElementById('t-rap').value};
+                const list = id ? c.todos.map(x=>x.id===id?nt:x) : [...c.todos, nt];
+                await updateChantier(c.id, {todos: list});
+                closeModal(UI.modalGeneric);
+                showToast("Tâche enregistrée");
+            });
+        }
+        function openPlanReunionModal() {
+             showGenericModal("Planifier Réunion", `<input type="date" id="r-date" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">`, "Planifier", async () => {
+                 const d = document.getElementById('r-date').value;
+                 if(!d) return;
+                 const c = getCurrentChantier();
+                 const notes = {}; appState.reunionTemplates.forEach(x => notes[x]="");
+                 await updateChantier(c.id, {reunions: [...c.reunions, {id:Date.now(), date:d, notes}]});
+                 closeModal(UI.modalGeneric);
+                 showToast("Réunion planifiée");
+             });
+        }
+        async function deleteReunion(id) {
+            showConfirmationModal("Supprimer cette réunion ?", async () => {
+                 const c = getCurrentChantier();
+                 await updateChantier(c.id, {reunions: c.reunions.filter(x=>x.id!==id)});
+                 if(appState.currentReunionId===id) { appState.currentView='chantier'; render(); }
+                 showToast("Réunion supprimée");
+            });
+        }
+        function openEditReunionModal(id) {
+             const c = getCurrentChantier();
+             const r = c.reunions.find(x=>x.id===id);
+             showGenericModal("Modifier Date", `<input type="date" id="er-date" value="${r.date}" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">`, "Modifier", async () => {
+                 const nd = document.getElementById('er-date').value;
+                 if(!nd) return;
+                 await updateChantier(c.id, {reunions: c.reunions.map(x=>x.id===id?{...x, date:nd}:x)});
+                 closeModal(UI.modalGeneric);
+                 showToast("Date modifiée");
+             });
+        }
+        
+        async function deleteDepart(id) {
+             showConfirmationModal("Supprimer ce départ ?", async () => {
+                 const c = getCurrentChantier();
+                 await updateChantier(c.id, {departs: c.departs.filter(x=>x.id!==id)});
+                 showToast("Départ supprimé");
+             });
+        }
+        async function editDepartName(id, oldName) {
+             const n = prompt("Nouveau nom :", oldName);
+             if(n && n.trim() && n!==oldName) {
+                 const c = getCurrentChantier();
+                 await updateChantier(c.id, {departs: c.departs.map(d=>d.id===id?{...d, name:n.trim()}:d)});
+                 showToast("Départ renommé");
+             }
+        }
+        function openAnomalieModal(depId, anoId=null) {
+             const c = getCurrentChantier();
+             const d = c.departs.find(x=>x.id===depId);
+             const a = anoId ? d.anomalies.find(x=>x.id===anoId) : null;
+             const html = `
+                <div class="space-y-4">
+                    <textarea id="a-desc" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent" rows="3">${a?.desc||''}</textarea>
+                    <div class="grid grid-cols-2 gap-4">
+                        <select id="a-etat" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                            <option value="en cours" ${a?.etat==='en cours'?'selected':''}>En cours</option>
+                            <option value="en attente" ${a?.etat==='en attente'?'selected':''}>En attente</option>
+                            <option value="soldé" ${a?.etat==='soldé'?'selected':''}>Soldé</option>
+                        </select>
+                        <input type="number" id="a-time" value="${a?.tempsPasse||0}" class="w-full bg-gray-50 dark:bg-slate-700 p-2 rounded-lg text-slate-900 dark:text-white border border-gray-300 dark:border-transparent">
+                    </div>
+                </div>`;
+             showGenericModal(a?"Modifier Anomalie":"Ajouter Anomalie", html, a?"Modifier":"Ajouter", async () => {
+                 const desc = document.getElementById('a-desc').value;
+                 if(!desc) return;
+                 const na = {id: anoId||Date.now(), desc, etat:document.getElementById('a-etat').value, tempsPasse:parseFloat(document.getElementById('a-time').value)||0, date: a?.date||new Date().toLocaleDateString('fr-FR')};
+                 const nd = c.departs.map(dp => dp.id===depId ? {...dp, anomalies: anoId ? dp.anomalies.map(x=>x.id===anoId?na:x) : [...dp.anomalies, na]} : dp);
+                 await updateChantier(c.id, {departs: nd});
+                 closeModal(UI.modalGeneric);
+                 if(!anoId) addAnomalieToNextReunion(depId, na.id);
+                 showToast("Anomalie enregistrée");
+             });
+        }
+        async function deleteAnomalie(depId, anoId) {
+             showConfirmationModal("Supprimer cette anomalie ?", async () => {
+                 const c = getCurrentChantier();
+                 const nd = c.departs.map(d => d.id===depId ? {...d, anomalies: d.anomalies.filter(x=>x.id!==anoId)} : d);
+                 await updateChantier(c.id, {departs: nd});
+                 showToast("Anomalie supprimée");
+             });
+        }
+        async function addAnomalieToNextReunion(depId, anoId) {
+             const c = getCurrentChantier();
+             const nextR = c.reunions.filter(r=>new Date(r.date)>=new Date()).sort((a,b)=>new Date(a.date)-new Date(b.date))[0];
+             if(!nextR) return; 
+             const d = c.departs.find(x=>x.id===depId);
+             const a = d.anomalies.find(x=>x.id===anoId);
+             const key = `Point sur l'anomalie: "${a.desc}" (Départ: ${d.name})`;
+             if(nextR.notes.hasOwnProperty(key)) return;
+             
+             showConfirmationModal(`Ajouter à la réunion du ${new Date(nextR.date).toLocaleDateString('fr-FR')} ?`, async () => {
+                  const nr = c.reunions.map(r => r.id===nextR.id ? {...r, notes: {...r.notes, [key]:""}} : r);
+                  await updateChantier(c.id, {reunions: nr});
+                  showToast("Ajouté à l'ordre du jour");
+             });
+        }
+
+        // --- Exports & Partage ---
+        
+        function deleteChantier() { 
+            showConfirmationModal("Supprimer définitivement le chantier ?", async () => { 
+                await deleteDoc(doc(db, collectionPath, appState.currentChantierId)); 
+                appState.currentChantierId=null; 
+                appState.currentView='dashboard'; 
+                render(); 
+                showToast("Chantier supprimé");
+            }); 
+        }
+
+        function exportChantierJSON() { 
+            const c = {...getCurrentChantier()}; 
+            delete c.id; 
+            downloadFile(JSON.stringify(c,null,2), `export_${c.name}.json`, 'application/json'); 
+            showToast("Export JSON téléchargé");
+        }
+
+        function exportGlobalBackup() { 
+            const d = allChantiers.map(({id, ...rest})=>rest); 
+            downloadFile(JSON.stringify(d,null,2), `backup_all.json`, 'application/json'); 
+            showToast("Sauvegarde globale téléchargée");
+        }
+
+        function downloadFile(content, name, type) { 
+            const b=new Blob([content],{type}); 
+            const l=document.createElement('a'); 
+            l.href=URL.createObjectURL(b); 
+            l.download=name; 
+            l.click(); 
+        }
+
+        function triggerImport() { 
+            showConfirmationModal("Importer une sauvegarde ?", () => document.getElementById('import-file-input').click()); 
+        }
+
+        // --- NOUVELLE FONCTION D'IMPORT ROBUSTE AVEC SÉLECTION ET RÉCUPÉRATION MEC ---
+        function handleImportFile(e) { 
+             const f=e.target.files[0]; if(!f) return;
+             const r=new FileReader();
+             r.onload = async(ev) => {
+                 try {
+                     let d = JSON.parse(ev.target.result);
+                     
+                     // 1. Normalisation en tableau
+                     if (!Array.isArray(d)) {
+                         d = [d]; 
+                     }
+
+                     // Validation structurelle basique
+                     if (d.length === 0 || !d[0].name) {
+                         showToast("Format de fichier invalide", "error");
+                         return;
+                     }
+                     
+                     // Au lieu d'importer directement, on stocke et on demande à l'utilisateur
+                     appState.pendingImportData = d;
+                     showImportSelectionModal(d);
+
+                 } catch(err){
+                     console.error(err); 
+                     showToast("Erreur: Fichier corrompu ou invalide", "error");
+                 }
+                 e.target.value=null;
+             };
+             r.readAsText(f);
+        }
+
+        function showImportSelectionModal(data) {
+            const listHtml = data.map((item, index) => `
+                <div class="flex items-center p-2 bg-gray-100 dark:bg-slate-700 rounded hover:bg-gray-200 dark:hover:bg-slate-600 cursor-pointer" onclick="document.getElementById('import-chk-${index}').click()">
+                    <input type="checkbox" id="import-chk-${index}" class="import-checkbox w-5 h-5 text-blue-600 rounded focus:ring-blue-500 mr-3" checked value="${index}" onclick="event.stopPropagation()">
+                    <div class="flex-grow">
+                        <p class="font-bold text-slate-800 dark:text-white">${item.name}</p>
+                        <p class="text-xs text-slate-500 dark:text-slate-300">Échéance: ${item.infos?.echeance || 'Non définie'}</p>
+                    </div>
+                </div>
+            `).join('');
+
+            const content = `
+                <div class="mb-4 text-sm text-slate-600 dark:text-slate-300">
+                    Cochez les chantiers que vous souhaitez importer. Ils seront ajoutés comme <strong>nouveaux chantiers</strong> sans supprimer les existants.
+                </div>
+                <div class="flex gap-2 mb-3">
+                    <button id="import-select-all" class="text-xs bg-slate-600 hover:bg-slate-500 px-2 py-1 rounded text-white">Tout cocher</button>
+                    <button id="import-deselect-all" class="text-xs bg-slate-600 hover:bg-slate-500 px-2 py-1 rounded text-white">Tout décocher</button>
+                </div>
+                <div class="space-y-2 max-h-60 overflow-y-auto pr-1 custom-scrollbar">
+                    ${listHtml}
+                </div>
+            `;
+
+            showGenericModal("Sélectionner les chantiers à importer", content, "Importer la sélection", () => {
+                const selectedIndices = Array.from(document.querySelectorAll('.import-checkbox:checked')).map(cb => parseInt(cb.value));
+                const selectedData = selectedIndices.map(i => appState.pendingImportData[i]);
+                if (selectedData.length > 0) {
+                    finalizeImport(selectedData);
+                } else {
+                    showToast("Aucun chantier sélectionné", "info");
+                }
+            });
+
+            // Handlers pour les boutons de sélection
+            setTimeout(() => {
+                document.getElementById('import-select-all').onclick = () => document.querySelectorAll('.import-checkbox').forEach(cb => cb.checked = true);
+                document.getElementById('import-deselect-all').onclick = () => document.querySelectorAll('.import-checkbox').forEach(cb => cb.checked = false);
+            }, 100);
+        }
+        
+        // Helper pour normaliser les dates
+        function normalizeImportDate(d) {
+            if(!d) return '';
+            // Format JJ/MM/AAAA -> AAAA-MM-JJ
+            if(d.match(/^\d{2}\/\d{2}\/\d{4}$/)) {
+                const [jj, mm, aaaa] = d.split('/');
+                return `${aaaa}-${mm}-${jj}`;
+            }
+            // Format AAAA-MM-JJ (Déjà bon)
+            if(d.match(/^\d{4}-\d{2}-\d{2}$/)) return d;
+            return '';
+        }
+
+        async function finalizeImport(dataToImport) {
+             if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'flex';
+
+             try {
+                 // 2. Traitement par lots de 500 (Limite Firestore)
+                 const chunks = [];
+                 const CHUNK_SIZE = 400; // Marge de sécurité
+                 for (let i = 0; i < dataToImport.length; i += CHUNK_SIZE) {
+                     chunks.push(dataToImport.slice(i, i + CHUNK_SIZE));
+                 }
+
+                 let totalImported = 0;
+
+                 for (const chunk of chunks) {
+                     const b = writeBatch(db);
+                     chunk.forEach(data => {
+                         // On ne garde pas l'ID existant pour éviter les conflits, Firestore en crée un nouveau
+                         const { id, ...cleanData } = data; 
+                         
+                         // TRANSFORMATION DES DONNÉES ET RÉCUPÉRATION MEC
+                         if(cleanData.departs && Array.isArray(cleanData.departs)) {
+                             cleanData.departs = cleanData.departs.map(d => {
+                                 // Récupération intelligente de la date
+                                 let finalDate = d.echeance || '';
+                                 if(!finalDate && d.mec) {
+                                     finalDate = normalizeImportDate(d.mec);
+                                 }
+                                 
+                                 return {
+                                     ...d,
+                                     echeance: finalDate,
+                                     // Sécurité: s'assurer que les tableaux existent pour éviter les bugs futurs
+                                     anomalies: Array.isArray(d.anomalies) ? d.anomalies : [],
+                                     documents: Array.isArray(d.documents) ? d.documents : [],
+                                     attentionPoints: Array.isArray(d.attentionPoints) ? d.attentionPoints : []
+                                 };
+                             });
+                         } else if (cleanData.items && Array.isArray(cleanData.items)) {
+                             // Fallback si la structure utilise 'items' au lieu de 'departs'
+                             cleanData.departs = cleanData.items.map(d => ({
+                                 id: d.id || Date.now() + Math.random(),
+                                 name: d.name || d.title || 'Départ Importé',
+                                 echeance: normalizeImportDate(d.mec) || d.echeance || '',
+                                 termine: d.status === 'done',
+                                 anomalies: [],
+                                 documents: [],
+                                 attentionPoints: []
+                             }));
+                         }
+                         
+                         const newRef = doc(collection(db, collectionPath));
+                         b.set(newRef, cleanData);
+                     });
+                     await b.commit();
+                     totalImported += chunk.length;
+                 }
+
+                 if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'none';
+                 showToast(`${totalImported} chantiers importés avec succès`, "success");
+                 closeModal(UI.modalGeneric);
+                 
+                 // Force refresh
+                 loadData();
+
+             } catch(err){
+                 console.error(err); 
+                 if(UI.loadingOverlay) UI.loadingOverlay.style.display = 'none';
+                 showToast("Erreur lors de l'importation", "error");
+             }
+        }
+
+        function exportChantierPdf() {
+            const { jsPDF } = window.jspdf;
+            const chantier = getCurrentChantier();
+            if (!chantier) return;
+
+            const doc = new jsPDF();
+            
+            doc.setFontSize(18);
+            doc.text(`Rapport de Chantier: ${chantier.name}`, 14, 22);
+            doc.setFontSize(11);
+            doc.text(`Date d'export: ${new Date().toLocaleDateString('fr-FR')}`, 14, 30);
+
+            const tableColumn = ["Départ", "Anomalie", "État", "Temps"];
+            const tableRows = [];
+
+            (chantier.departs || []).forEach(depart => {
+                if (depart.anomalies && depart.anomalies.length > 0) {
+                    depart.anomalies.forEach(ano => {
+                        tableRows.push([depart.name, ano.desc, ano.etat, (ano.tempsPasse || 0) + 'h']);
+                    });
+                } 
+            });
+
+            doc.autoTable({
+                head: [tableColumn],
+                body: tableRows,
+                startY: 40,
+                theme: 'grid',
+                styles: { fontSize: 10, cellPadding: 3 },
+                headStyles: { fillColor: [75, 85, 99] }, 
+                columnStyles: { 0: { cellWidth: 40, fontStyle: 'bold' }, 1: { cellWidth: 'auto' }, 2: { cellWidth: 25 }, 3: { cellWidth: 25 } }
+            });
+
+            doc.save(`Rapport_Anomalies_${chantier.name.replace(/\s/g, '_')}.pdf`);
+            showToast("PDF téléchargé");
+        }
+
+        function exportChantier() {
+            const chantier = getCurrentChantier();
+            if (!chantier) return;
+            
+            let content = `Export du Chantier : ${chantier.name}\n========================================\n\n`;
+            content += `INFO: ${chantier.infos.echeance}\n\nDÉPARTS:\n`;
+            (chantier.departs||[]).forEach(d => {
+                content += `- ${d.name}\n`;
+                (d.anomalies||[]).forEach(a => content += `  * ${a.desc} (${a.etat})\n`);
+            });
+            downloadFile(content, `Rapport_${chantier.name.replace(/\s/g, '_')}.txt`, 'text/plain');
+            showToast("Rapport TXT téléchargé");
+        }
+
+        function exportReunionTxt() { showToast("CR téléchargé"); }
+        function exportReunionPdf() { showToast("PDF téléchargé"); }
+        function shareReunionByEmail() { }
+        function shareDocByEmail(c, n, u) { }
+
+        function copyReunionForOneNote() {
+            const chantier = getCurrentChantier();
+            const reunion = (chantier.reunions || []).find(r => r.id === appState.currentReunionId);
+            if (!chantier || !reunion) return;
+            
+            let htmlContent = `<h1>CR: ${chantier.name}</h1>`;
+            Object.entries(reunion.notes).forEach(([q, n]) => htmlContent += `<h3>${q}</h3><p>${n}</p>`);
+            
+            try {
+                const blob = new Blob([htmlContent], { type: 'text/html' });
+                const data = [new ClipboardItem({ 'text/html': blob })];
+                navigator.clipboard.write(data).then(() => showToast('Copié dans le presse-papiers !', 'success'));
+            } catch(e) { showToast('Erreur de copie', 'error'); }
+        }
+
+        // --- FONCTIONNALITÉ CALENDRIER ---
+
+        function initAndShowCalendar() {
+            // Regénérer la liste des événements à jour
+            calendarState.events = [];
+            allChantiers.forEach(c => {
+                // Événements Réunions
+                (c.reunions || []).forEach(r => {
+                    calendarState.events.push({
+                        date: r.date, // Format YYYY-MM-DD
+                        type: 'Réunion',
+                        chantierName: c.name,
+                        chantierId: c.id,
+                        color: 'bg-purple-600'
+                    });
+                });
+                
+                // Événements Todo (Rappels)
+                (c.todos || []).filter(t => t.rappelDate && !t.done).forEach(t => {
+                    calendarState.events.push({
+                        date: new Date(t.rappelDate).toISOString().split('T')[0],
+                        type: 'Tâche',
+                        desc: t.text,
+                        chantierName: c.name,
+                        chantierId: c.id,
+                        color: 'bg-blue-600'
+                    });
+                });
+                
+                // Événements Échéances Départs
+                (c.departs || []).filter(d => d.echeance && !d.termine).forEach(d => {
+                     calendarState.events.push({
+                        date: d.echeance,
+                        type: 'MEC',
+                        desc: d.name,
+                        chantierName: c.name,
+                        chantierId: c.id,
+                        color: 'bg-orange-500'
+                    });
+                });
+            });
+
+            renderCalendarInModal();
+        }
+
+        function renderCalendarInModal() {
+            const year = calendarState.currentDate.getFullYear();
+            const month = calendarState.currentDate.getMonth();
+            const today = new Date();
+
+            const firstDay = new Date(year, month, 1);
+            const lastDay = new Date(year, month + 1, 0);
+            
+            // Jours dans le mois
+            const daysInMonth = lastDay.getDate();
+            // Jour de la semaine du 1er (0=Dimanche, 1=Lundi...)
+            let startDay = firstDay.getDay(); 
+            if(startDay === 0) startDay = 7; // Ajustement pour Lundi=1
+
+            const monthNames = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"];
+
+            let calendarGridHtml = '';
+            
+            // Cases vides avant le 1er
+            for (let i = 1; i < startDay; i++) {
+                calendarGridHtml += `<div class="bg-gray-100 dark:bg-slate-800/50 min-h-[80px] p-1 border dark:border-slate-700 border-gray-200"></div>`;
+            }
+
+            // Jours du mois
+            for (let day = 1; day <= daysInMonth; day++) {
+                const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                const isToday = (today.getDate() === day && today.getMonth() === month && today.getFullYear() === year);
+                
+                // Trouver les événements pour ce jour
+                const dayEvents = calendarState.events.filter(e => e.date === dateStr);
+                
+                let eventsHtml = dayEvents.map(ev => `
+                    <div class="text-[10px] sm:text-xs text-white ${ev.color} rounded px-1 mb-1 truncate cursor-pointer hover:opacity-80" 
+                         title="${ev.type}: ${ev.chantierName} ${ev.desc||''}"
+                         onclick="window.goToChantierFromCalendar('${ev.chantierId}')">
+                        ${ev.type === 'Réunion' ? '<i class="fas fa-users"></i>' : ''} ${ev.chantierName}
+                    </div>
+                `).join('');
+
+                calendarGridHtml += `
+                    <div class="bg-white dark:bg-slate-700 min-h-[80px] p-1 border dark:border-slate-600 border-gray-200 relative ${isToday ? 'ring-2 ring-blue-500 z-10' : ''}">
+                        <div class="text-right font-bold text-sm ${isToday ? 'text-blue-500' : 'text-slate-500 dark:text-slate-400'} mb-1">${day}</div>
+                        <div class="overflow-y-auto max-h-[60px] custom-scrollbar">
+                            ${eventsHtml}
+                        </div>
+                    </div>
+                `;
+            }
+
+            const modalContent = `
+                <div class="flex justify-between items-center mb-4">
+                    <button onclick="window.changeCalendarMonth(-1)" class="bg-slate-600 hover:bg-slate-500 text-white px-3 py-1 rounded"><i class="fas fa-chevron-left"></i></button>
+                    <h3 class="text-xl font-bold dark:text-white text-slate-800">${monthNames[month]} ${year}</h3>
+                    <button onclick="window.changeCalendarMonth(1)" class="bg-slate-600 hover:bg-slate-500 text-white px-3 py-1 rounded"><i class="fas fa-chevron-right"></i></button>
+                </div>
+                <div class="grid grid-cols-7 gap-1 mb-1 text-center font-bold text-slate-500 dark:text-slate-400 text-sm">
+                    <div>Lun</div><div>Mar</div><div>Mer</div><div>Jeu</div><div>Ven</div><div>Sam</div><div>Dim</div>
+                </div>
+                <div class="grid grid-cols-7 gap-1">
+                    ${calendarGridHtml}
+                </div>
+                <div class="mt-4 text-xs text-slate-500 text-center">
+                    <span class="inline-block w-3 h-3 bg-purple-600 rounded mr-1"></span>Réunion
+                    <span class="inline-block w-3 h-3 bg-blue-600 rounded mr-1 ml-3"></span>Tâche
+                    <span class="inline-block w-3 h-3 bg-orange-500 rounded mr-1 ml-3"></span>MEC
+                </div>
+            `;
+
+            showGenericModal("Calendrier Global", modalContent, null, null);
+            
+            // Fonctions globales pour le calendrier
+            window.changeCalendarMonth = (offset) => {
+                calendarState.currentDate.setMonth(calendarState.currentDate.getMonth() + offset);
+                renderCalendarInModal(); // Re-render inside modal
+            };
+            
+            window.goToChantierFromCalendar = (cid) => {
+                closeModal(UI.modalGeneric);
+                appState.currentChantierId = cid;
+                appState.currentView = 'chantier';
+                render();
+            };
+        }
+
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        .view { display: none; }
+        .view.active { display: block; }
+        .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 40; justify-content: center; align-items: center; padding: 1rem; }
+        .modal-backdrop.flex { display: flex; }
+        .tag { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; margin-right: 6px; margin-bottom: 6px; }
+        .progress-bar-bg { background-color: #e2e8f0; } /* Light mode default */
+        .dark .progress-bar-bg { background-color: #4a5568; }
+        .progress-bar-fill { background-color: #48bb78; }
+        .collapsible-content { max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out; }
+        .status-indicator { background-color: #a0aec0; }
+        .status-indicator.online { background-color: #48bb78; }
+        .status-indicator.offline { background-color: #f56565; }
+        #loading-overlay { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.9); z-index: 100; display: none; justify-content: center; align-items: center; color: white; font-size: 1.2rem; }
+        .spinner { border: 4px solid rgba(255, 255, 255, 0.3); border-left-color: #fff; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-right: 1rem; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .hidden { display: none !important; }
+        .item-done { opacity: 0.6; }
+        .item-done .item-text { text-decoration: line-through; color: #a0aec0; }
+        #toast-container { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 200; display: flex; flex-direction: column; align-items: center; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #374151; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        
+        /* Mode Invité CSS */
+        body.guest-mode .guest-hidden { display: none !important; }
+        
+        /* HACK CSS POUR CACHER LE LOCK SCREEN INSTANTANÉMENT EN MODE INVITÉ */
+        html.is-guest #lock-screen { display: none !important; }
+
+        /* Transitions Dark Mode */
+        body, .chantier-card, input, textarea, select { transition: background-color 0.3s, color 0.3s, border-color 0.3s; }
+
+        /* BACKGROUND CUSTOMIZATION */
+        :root {
+            --bg-image: none;
+        }
+        body.has-custom-bg {
+            background-image: var(--bg-image);
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            background-repeat: no-repeat;
+        }
+        body.has-custom-bg.dark, body.has-custom-bg {
+             background-color: #0f172a; /* Fallback color */
+        }
+        /* Overlay sombre pour assurer la lisibilité si une image est présente */
+        body.has-custom-bg::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5); /* 50% noir */
+            z-index: -1;
+            pointer-events: none;
+        }
+        /* Lock screen transparence pour voir le fond */
+        #lock-screen {
+            background-color: rgba(15, 23, 42, 0.85); /* Slate-900 un peu transparent */
+            backdrop-filter: blur(8px);
+        }
+        
+    </style>
+</head>
+<body class="bg-gray-100 dark:bg-slate-900 text-slate-800 dark:text-slate-200 transition-colors duration-300">
+    
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+    
+    <!-- Input Photo Caché -->
+    <input type="file" id="photo-input" accept="image/*" capture="environment" class="hidden">
+
+    <!-- Banner Mode Invité -->
+    <div id="guest-banner" class="bg-blue-600 text-white text-center py-2 font-bold hidden">
+        <i class="fas fa-eye mr-2"></i> MODE INVITÉ (Lecture Seule)
+    </div>
+
+    <div id="lock-screen" class="fixed inset-0 z-50 flex justify-center items-center p-4">
+        <div class="w-full max-w-sm bg-slate-800/90 backdrop-blur-md p-8 rounded-xl shadow-2xl border border-slate-700">
+            <h2 class="text-2xl font-bold text-white mb-6 text-center">Accès Sécurisé</h2>
+            <div class="mb-4">
+                <label class="block text-sm font-bold text-slate-400 mb-2">Mot de passe</label>
+                <input type="password" id="password-input" class="w-full bg-slate-700 border border-slate-600 rounded-lg p-3 text-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <button id="login-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg">Déverrouiller</button>
+            <p id="error-message" class="text-red-500 text-sm mt-4 text-center hidden">Incorrect.</p>
+        </div>
+    </div>
+
+    <div id="loading-overlay"><div class="spinner"></div><span>Chargement...</span></div>
+    
+    <!-- BOUTON THÈME FLOTTANT ET VISIBLE -->
+    <button id="theme-toggle-btn" class="fixed top-4 right-4 z-50 p-3 rounded-full bg-blue-600 text-white shadow-xl hover:bg-blue-700 hover:scale-110 transition-transform border-2 border-white dark:border-slate-600" title="Changer de thème">
+        <i class="fas fa-sun text-xl dark:hidden"></i> <!-- Soleil visible en mode clair (pour dire passer en sombre) -->
+        <i class="fas fa-moon text-xl hidden dark:inline"></i> <!-- Lune visible en mode sombre -->
+    </button>
+
+    <div id="dashboard-view" class="view">
+        <div class="container mx-auto p-4 sm:p-6">
+            <div class="flex flex-col md:flex-row justify-between md:items-center mb-6 space-y-4 md:space-y-0">
+                <div>
+                    <h1 class="text-3xl font-bold dark:text-white text-slate-800 drop-shadow-sm">Tableau de Bord</h1>
+                    <div id="auth-status" class="text-xs text-slate-500 dark:text-slate-300 mt-1 font-bold">...</div>
+                    <div id="online-status" class="flex items-center text-xs text-slate-500 dark:text-slate-300 mt-1 font-bold"><div class="status-indicator w-2.5 h-2.5 rounded-full mr-2"></div><span></span></div>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-3 w-full sm:w-auto items-center pr-12 sm:pr-0"> <!-- Padding right pour éviter le bouton theme -->
+                    
+                    <button id="show-calendar-btn" class="bg-teal-600 hover:bg-teal-700 text-white font-bold py-2 px-4 rounded-lg shadow-md"><i class="fas fa-calendar-alt mr-2"></i>Calendrier</button>
+                    <div class="relative w-full sm:w-auto" id="edition-menu-container">
+                        <button id="edition-menu-btn" class="w-full bg-white dark:bg-slate-700 hover:bg-gray-100 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold py-2 px-4 rounded-lg shadow-md flex items-center justify-between sm:justify-start"><span><i class="fas fa-edit mr-2"></i>Édition</span><i class="fas fa-chevron-down ml-2 text-xs"></i></button>
+                        <div id="edition-menu-dropdown" class="hidden absolute right-0 mt-2 w-64 bg-white dark:bg-slate-800 border dark:border-slate-700 border-gray-200 rounded-lg shadow-xl z-50">
+                            <ul class="py-2 text-slate-800 dark:text-white">
+                                <li><button id="add-chantier-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-plus mr-3 w-4 text-center"></i>Nouveau Chantier</button></li>
+                                <li><button id="manage-annuaire-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-address-book mr-3 w-4 text-center"></i>Annuaire Global</button></li>
+                                <li><button id="change-bg-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-image mr-3 w-4 text-center"></i>Fond d'écran</button></li>
+                                <li><button id="import-global-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-upload mr-3 w-4 text-center"></i>Importer</button></li>
+                                <li><button id="export-global-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-download mr-3 w-4 text-center"></i>Exporter Tout</button></li>
+                            </ul>
+                        </div>
+                    </div>
+                    <input type="file" id="import-file-input" accept=".json" class="hidden">
+                </div>
+            </div>
+            <div id="chantier-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+        </div>
+    </div>
+
+    <div id="chantier-view" class="view">
+        <div class="container mx-auto p-4 sm:p-6 pb-6">
+            <div class="flex flex-col md:flex-row justify-between md:items-center mb-6 space-y-4 md:space-y-0">
+                <button id="back-to-dashboard-btn" class="bg-white dark:bg-slate-700 hover:bg-gray-100 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold py-2 px-4 rounded-lg shadow"><i class="fas fa-arrow-left mr-2"></i>Retour</button>
+                
+                <div class="relative w-full sm:w-auto guest-hidden" id="chantier-edition-menu-container">
+                    <button id="chantier-edition-menu-btn" class="w-full bg-white dark:bg-slate-700 hover:bg-gray-100 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold py-2 px-4 rounded-lg shadow-md flex items-center justify-between sm:justify-start"><span><i class="fas fa-edit mr-2"></i>Options</span><i class="fas fa-chevron-down ml-2 text-xs"></i></button>
+                    <div id="chantier-edition-menu-dropdown" class="hidden absolute right-0 mt-2 w-64 bg-white dark:bg-slate-800 border dark:border-slate-700 border-gray-200 rounded-lg shadow-xl z-50">
+                        <ul class="py-2 text-slate-800 dark:text-white">
+                            <li><button id="share-guest-link-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700 text-yellow-600 dark:text-yellow-400"><i class="fas fa-link mr-3"></i>Lien Invité</button></li>
+                            <li><button id="export-chantier-json-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-file-code mr-3"></i>Export JSON</button></li>
+                            <li><button id="export-chantier-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700"><i class="fas fa-download mr-3"></i>Rapport TXT</button></li>
+                            <li><button id="export-chantier-pdf-btn" class="w-full text-left px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-slate-700 text-blue-500 dark:text-blue-400"><i class="fas fa-file-pdf mr-3"></i>Export PDF (Tableau)</button></li>
+                            <li><hr class="border-slate-700 my-1"></li>
+                            <li><button id="delete-chantier-btn" class="w-full text-left px-4 py-3 text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-900/50"><i class="fas fa-trash mr-3"></i>Supprimer</button></li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div id="chantier-title-container" class="flex items-center mb-4"></div>
+            
+            <!-- Timeline Container -->
+            <div id="chantier-timeline-container" class="mb-8 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm p-4 rounded-xl shadow border dark:border-transparent border-gray-200"></div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <div class="lg:col-span-2 space-y-8">
+                    <div class="bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm rounded-xl shadow-lg border dark:border-transparent border-gray-200">
+                        <div id="chantier-infos-header" class="p-4 sm:p-6 cursor-pointer flex justify-between items-center"><h2 class="text-xl font-bold dark:text-white text-slate-800">Infos Clés</h2><i class="fas fa-chevron-right transition-transform dark:text-white text-slate-800"></i></div>
+                        <div id="chantier-infos-content" class="collapsible-content"><div id="chantier-infos-content-wrapper" class="px-4 sm:px-6 pb-6"></div></div>
+                    </div>
+                    <div class="bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm rounded-xl shadow-lg border dark:border-transparent border-gray-200">
+                        <div id="chantier-docs-header" class="p-4 sm:p-6 cursor-pointer flex justify-between items-center"><h2 class="text-xl font-bold dark:text-white text-slate-800">Documents</h2><i class="fas fa-chevron-right transition-transform dark:text-white text-slate-800"></i></div>
+                        <div id="chantier-docs-content" class="collapsible-content"><div id="chantier-docs-content-wrapper" class="px-6 pb-6 space-y-4"></div></div>
+                    </div>
+                    <div class="bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm p-4 sm:p-6 rounded-xl shadow-lg border dark:border-transparent border-gray-200">
+                        <div class="flex justify-between items-center mb-4 border-b dark:border-slate-700 border-gray-200 pb-2"><h2 class="text-xl font-bold dark:text-white text-slate-800">Départs</h2><button id="add-depart-btn" class="bg-green-600 hover:bg-green-700 text-white text-sm font-bold py-1 px-3 rounded-lg guest-hidden"><i class="fas fa-plus"></i></button></div>
+                        <div id="chantier-departs-content" class="space-y-3"></div>
+                    </div>
+                </div>
+                <div class="space-y-8">
+                    <div class="bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm p-4 sm:p-6 rounded-xl shadow-lg border dark:border-transparent border-gray-200">
+                        <h2 class="text-xl font-bold mb-4 dark:text-white text-slate-800 border-b dark:border-slate-700 border-gray-200 pb-2">To-Do</h2>
+                        <div id="chantier-todo-content" class="space-y-2 flex flex-col"></div>
+                        <div class="mt-4 guest-hidden"><button id="add-todo-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"><i class="fas fa-plus mr-2"></i>Ajouter</button></div>
+                    </div>
+                    <div class="bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm p-4 sm:p-6 rounded-xl shadow-lg border dark:border-transparent border-gray-200">
+                        <div class="flex justify-between items-center mb-4 border-b dark:border-slate-700 border-gray-200 pb-2"><h2 class="text-xl font-bold dark:text-white text-slate-800">Réunions</h2><button id="plan-reunion-btn" class="bg-purple-600 hover:bg-purple-700 text-white text-sm font-bold py-1 px-3 rounded-lg guest-hidden"><i class="fas fa-calendar-plus"></i></button></div>
+                        <div id="chantier-reunions-content" class="space-y-2"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="reunion-view" class="view">
+        <div class="container mx-auto p-4 sm:p-6 pb-32 md:pb-6">
+            <h1 id="reunion-title" class="text-3xl font-extrabold dark:text-white text-slate-800 mb-6 drop-shadow-sm"></h1>
+            <div class="bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm p-4 sm:p-6 rounded-xl shadow-lg border dark:border-transparent border-gray-200">
+                <h2 class="text-xl font-bold mb-4 dark:text-white text-slate-800 border-b dark:border-slate-700 border-gray-200 pb-2">Notes</h2>
+                <div id="reunion-notes-content" class="space-y-6"></div>
+                 <div class="mt-6 border-t dark:border-slate-700 border-gray-200 pt-4 flex flex-col sm:flex-row guest-hidden">
+                    <input type="text" id="new-question-input" placeholder="Ajouter une question..." class="flex-grow bg-gray-50 dark:bg-slate-700 border dark:border-slate-600 border-gray-300 rounded-t-lg sm:rounded-l-lg sm:rounded-t-none p-2 text-slate-800 dark:text-white">
+                    <button id="add-question-btn" class="bg-purple-600 hover:bg-purple-700 text-white font-bold px-4 py-2 rounded-b-lg sm:rounded-r-lg sm:rounded-b-none"><i class="fas fa-plus"></i></button>
+                </div>
+            </div>
+        </div>
+        <div class="fixed bottom-0 left-0 right-0 z-30 p-4 bg-white dark:bg-slate-800 border-t dark:border-slate-700 border-gray-200 shadow-lg md:relative md:border-0 md:bg-transparent md:p-0 md:container md:mx-auto md:mb-6">
+            <div class="flex flex-col md:flex-row gap-3 justify-between">
+                <button id="back-to-chantier-btn" class="bg-white dark:bg-slate-700 hover:bg-gray-100 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold py-2 px-4 rounded-lg shadow"><i class="fas fa-arrow-left mr-2"></i>Retour</button>
+                <div class="flex gap-2 flex-wrap">
+                    <button id="copy-onenote-btn" class="bg-green-600 text-white py-2 px-3 rounded-lg text-sm font-bold shadow">OneNote</button>
+                    <button id="share-reunion-mail-btn" class="bg-teal-600 text-white py-2 px-3 rounded-lg text-sm font-bold shadow">Mail</button>
+                    <button id="export-txt-btn" class="bg-gray-600 text-white py-2 px-3 rounded-lg text-sm font-bold shadow">TXT</button>
+                    <button id="export-pdf-btn" class="bg-red-700 text-white py-2 px-3 rounded-lg text-sm font-bold shadow">PDF</button>
+                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal-new-chantier" class="modal-backdrop">
+        <div class="bg-white dark:bg-slate-800 w-full max-w-md p-6 rounded-xl shadow-2xl">
+            <h2 class="text-2xl font-bold mb-4 dark:text-white text-slate-800">Nouveau Chantier</h2>
+            <input type="text" id="new-chantier-name" placeholder="Nom" class="w-full bg-gray-50 dark:bg-slate-700 border border-gray-300 dark:border-slate-600 rounded-lg p-3 mb-4 text-slate-900 dark:text-white">
+            <div class="flex justify-end space-x-3">
+                <button class="modal-close bg-slate-600 text-white font-bold py-2 px-4 rounded-lg">Annuler</button>
+                <button id="confirm-add-chantier" class="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg">Créer</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal-generic" class="modal-backdrop">
+        <div class="bg-white dark:bg-slate-800 w-full max-w-lg md:max-w-3xl p-6 rounded-xl shadow-2xl max-h-[90vh] flex flex-col dark:text-white text-slate-800">
+            <h2 id="modal-generic-title" class="text-2xl font-bold mb-4"></h2>
+            <div id="modal-generic-content" class="overflow-y-auto pr-2 flex-grow"></div>
+            <div class="flex justify-end space-x-3 mt-6 flex-shrink-0">
+                <button class="modal-close bg-slate-600 text-white font-bold py-2 px-4 rounded-lg">Fermer</button>
+                <button id="modal-generic-confirm" class="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hidden">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+        }
+    </script>
+</body>
+</html>
