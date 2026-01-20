@@ -1442,7 +1442,12 @@
                 const text = document.getElementById('t-txt').value;
                 if(!text) return;
                 const nt = {id: id||Date.now(), text, done: t?.done||false, rappelDate: document.getElementById('t-rap').value};
-                const list = id ? c.todos.map(x=>x.id===id?nt:x) : [...c.todos, nt];
+                
+                // --- SÉCURITÉ AJOUTÉE ICI ---
+                const currentTodos = c.todos || [];
+                const list = id ? currentTodos.map(x=>x.id===id?nt:x) : [...currentTodos, nt];
+                // ----------------------------
+                
                 await updateChantier(c.id, {todos: list});
                 closeModal(UI.modalGeneric);
                 showToast("Tâche enregistrée");
@@ -1454,7 +1459,12 @@
                  if(!d) return;
                  const c = getCurrentChantier();
                  const notes = {}; appState.reunionTemplates.forEach(x => notes[x]="");
-                 await updateChantier(c.id, {reunions: [...c.reunions, {id:Date.now(), date:d, notes}]});
+                 
+                 // --- SÉCURITÉ AJOUTÉE ICI ---
+                 const currentReunions = c.reunions || [];
+                 await updateChantier(c.id, {reunions: [...currentReunions, {id:Date.now(), date:d, notes}]});
+                 // ----------------------------
+                 
                  closeModal(UI.modalGeneric);
                  showToast("Réunion planifiée");
              });
